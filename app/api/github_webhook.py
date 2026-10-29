@@ -1,4 +1,3 @@
-
 """GitHub push webhook receiver connected to GitHub and Ollama code review."""
 
 import json
@@ -18,9 +17,10 @@ router = APIRouter(prefix="/webhooks", tags=["github"])
 
 @router.post("/github")
 async def receive_github_webhook(request: Request) -> dict[str, Any]:
-    # Verify the signature against the exact raw request bytes.
+    # Read the raw body because GitHub's signature is calculated from these exact bytes.
     body = await request.body()
 
+    # Reject requests if the webhook secret is not configured.
     if not GITHUB_WEBHOOK_SECRET:
         logger.error("GITHUB_WEBHOOK_SECRET is not configured")
         raise HTTPException(
@@ -28,6 +28,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             detail="Webhook secret is not configured.",
         )
 
+    # Verify that the request was signed with the shared GitHub webhook secret.
     signature = request.headers.get("X-Hub-Signature-256")
 
     if not verify_github_signature(
@@ -38,9 +39,11 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             detail="Invalid GitHub webhook signature.",
         )
 
+    # Read event metadata for filtering and troubleshooting.
     event_name = request.headers.get("X-GitHub-Event", "")
     delivery_id = request.headers.get("X-GitHub-Delivery", "unknown")
 
+    # Only push events trigger code reviews.
     if event_name != "push":
         return {
             "status": "ignored",
@@ -49,6 +52,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             "delivery_id": delivery_id,
         }
 
+    # Parse the signed request body as JSON.
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -63,6 +67,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             detail="Webhook JSON must be an object.",
         )
 
+    # Extract the repository that received the push.
     repository = payload.get("repository")
 
     if not isinstance(repository, dict):
@@ -79,6 +84,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             detail="Missing repository.full_name.",
         )
 
+    # Validate the Git reference and ignore tag pushes.
     branch_ref = payload.get("ref")
 
     if not isinstance(branch_ref, str) or not branch_ref:
@@ -87,7 +93,6 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             detail="Missing or invalid ref.",
         )
 
-    # This version supports branch pushes, not tags.
     if not branch_ref.startswith("refs/heads/"):
         return {
             "status": "ignored",
@@ -96,8 +101,10 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             "delivery_id": delivery_id,
         }
 
+    # Convert refs/heads/main into the branch name main.
     branch = branch_ref.removeprefix("refs/heads/")
 
+    # Review only branches configured in the application settings.
     if branch not in ALLOWED_BRANCHES:
         return {
             "status": "ignored",
@@ -107,6 +114,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             "delivery_id": delivery_id,
         }
 
+    # The 'after' field identifies the commit at the end of the push.
     commit_sha = payload.get("after")
 
     if not isinstance(commit_sha, str) or not commit_sha:
@@ -115,7 +123,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             detail="Missing target commit SHA in after field.",
         )
 
-    # GitHub uses forty zeroes when a branch is deleted.
+    # GitHub represents a deleted branch with a SHA of forty zeroes.
     if len(commit_sha) == 40 and set(commit_sha) == {"0"}:
         return {
             "status": "ignored",
@@ -124,6 +132,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             "delivery_id": delivery_id,
         }
 
+    # Reject malformed commit identifiers before calling the GitHub API.
     if len(commit_sha) != 40 or any(
         character not in "0123456789abcdefABCDEF"
         for character in commit_sha
@@ -141,7 +150,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
         commit_sha,
     )
 
-    # Step 1: Retrieve the commit and changed-file contents from GitHub.
+    # Step 1: Fetch commit details, changed files, and available source content.
     try:
         async with GitHubClient() as github:
             commit_data = await github.fetch_commit(
@@ -168,6 +177,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
             ),
         ) from exc
 
+    # Build a summary of each file without including its source code in the response.
     file_summaries = [
         {
             "path": item["path"],
@@ -189,7 +199,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
         len(file_summaries),
     )
 
-    # Step 2: Send eligible changed-file contents to local Ollama.
+    # Step 2: Filter eligible files and send them to the local Ollama model for review.
     try:
         review_result = await review_commit_files(
             commit_data["files"]
@@ -216,7 +226,7 @@ async def receive_github_webhook(request: Request) -> dict[str, Any]:
         review_result["skipped_file_count"],
     )
 
-    # Return review findings and file metadata, not the source code.
+    # Return commit metadata, review findings, and skipped-file details.
     return {
         "status": "accepted",
         "message": "GitHub commit retrieved and AI review completed.",
