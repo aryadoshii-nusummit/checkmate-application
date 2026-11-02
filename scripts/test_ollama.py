@@ -1,7 +1,7 @@
 
 import asyncio
 
-from app.review.ollama_client import OllamaClient
+from app.services.ollama_service import OllamaClient
 
 
 async def main():
@@ -28,3 +28,6 @@ print(divide(10, 0))
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
