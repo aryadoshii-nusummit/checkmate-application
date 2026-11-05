@@ -1,281 +1,118 @@
-"""Receive GitHub push events and trigger AI-powered code reviews."""
+"""
+GitHub webhook API endpoints.
 
-import json
+This module exposes the HTTP endpoint used by GitHub to notify Checkmate
+when a repository receives a push event.
+
+Responsibilities of this API layer:
+1. Receive incoming GitHub webhook requests.
+2. Use FastAPI dependencies to authenticate and validate webhook data.
+3. Obtain the application service responsible for processing the webhook.
+4. Delegate the actual workflow to the service layer.
+5. Return a structured response or an appropriate HTTP error.
+
+Important:
+GitHub API communication, commit retrieval, file processing, and AI-based
+code reviews are intentionally handled by service modules rather than
+inside this API endpoint. This keeps the API layer thin and maintainable.
+"""
+
 import logging
-from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.config.settings import ALLOWED_BRANCHES, GITHUB_WEBHOOK_SECRET
-from app.services.github_service import GitHubAPIError, GitHubClient
-from app.services.review_service import review_commit_files
-from app.utils.webhook_signature import verify_github_signature
+# Dependency responsible for authenticating and validating GitHub webhooks.
+# FastAPI executes this dependency before calling the endpoint function.
+from app.dependencies.github import verify_github_webhook
 
+# Dependency that provides the application service responsible for
+# coordinating GitHub commit retrieval and AI code review.
+from app.dependencies.services import get_webhook_service
+
+# Pydantic models define the validated webhook information received
+# from the verification dependency and the response returned to GitHub.
+from app.models.github import (
+    GitHubWebhookResponse,
+    WebhookVerification,
+)
+
+# The service handles the actual webhook processing workflow.
+# WebhookProcessingError represents expected application-level failures
+# that need to be translated into appropriate HTTP responses.
+from app.services.webhook_service import (
+    WebhookProcessingError,
+    WebhookService,
+)
+
+
+# Use the module-level logger to record errors and operational information.
+# This allows webhook processing issues to be traced without adding
+# logging implementation details to the business logic.
 logger = logging.getLogger(__name__)
 
-# Register all GitHub webhook endpoints under the /webhooks prefix.
-router = APIRouter(prefix="/webhooks", tags=["github"])
+
+# Group GitHub-related endpoints under the /webhooks URL prefix.
+# The "github" tag also groups this endpoint in the FastAPI documentation.
+router = APIRouter(
+    prefix="/webhooks",
+    tags=["github"],
+)
 
 
-@router.post("/github")
-async def receive_github_webhook(request: Request) -> dict[str, Any]:
-    # Read the original request body because GitHub calculates its
-    # signature using the exact raw bytes sent in the webhook request.
-    body = await request.body()
+@router.post(
+    "/github",
+    response_model=GitHubWebhookResponse,
+)
+async def receive_github_webhook(
+    verification: WebhookVerification = Depends(verify_github_webhook),
+    webhook_service: WebhookService = Depends(get_webhook_service),
+) -> GitHubWebhookResponse:
+    """
+    Receive a GitHub webhook and delegate its processing to the service layer.
 
-    # A configured secret is required to authenticate incoming webhooks.
-    # Reject the request if the application has not been configured securely.
-    if not GITHUB_WEBHOOK_SECRET:
-        logger.error("GITHUB_WEBHOOK_SECRET is not configured")
-        raise HTTPException(
-            status_code=500,
-            detail="Webhook secret is not configured.",
-        )
+    FastAPI resolves both dependencies before executing this function:
 
-    # Verify that the request was signed using the shared GitHub secret.
-    # This prevents unauthenticated clients from triggering code reviews.
-    signature = request.headers.get("X-Hub-Signature-256")
+    - verify_github_webhook:
+      Verifies the webhook signature, validates the event and payload,
+      and checks whether the pushed branch is configured for review.
 
-    if not verify_github_signature(
-        body, signature, GITHUB_WEBHOOK_SECRET
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid GitHub webhook signature.",
-        )
+    - get_webhook_service:
+      Provides the service responsible for coordinating the review workflow.
 
-    # Extract event details for filtering, logging, and response tracking.
-    event_name = request.headers.get("X-GitHub-Event", "")
-    delivery_id = request.headers.get("X-GitHub-Delivery", "unknown")
+    The endpoint does not directly communicate with GitHub or Ollama.
+    It delegates those operations to WebhookService and returns its
+    structured Pydantic response.
 
-    # Checkmate currently processes push events only.
-    # Other GitHub events are acknowledged but do not trigger a review.
-    if event_name != "push":
-        return {
-            "status": "ignored",
-            "reason": "unsupported_event",
-            "event": event_name,
-            "delivery_id": delivery_id,
-        }
+    Args:
+        verification:
+            Validated webhook information produced by the verification
+            dependency.
 
-    # Parse the authenticated request body into a JSON object.
-    # Invalid JSON is rejected before any GitHub API calls are made.
+        webhook_service:
+            Application service that coordinates commit retrieval,
+            changed-file processing, and AI code review.
+
+    Returns:
+        GitHubWebhookResponse:
+            Structured response describing the webhook processing result.
+
+    Raises:
+        HTTPException:
+            Returns an appropriate HTTP error when the service reports
+            an expected webhook-processing failure.
+    """
+
     try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # Delegate the complete webhook workflow to the application service.
+        # The service handles ignored events, GitHub API communication,
+        # changed-file summaries, AI reviews, and response preparation.
+        return await webhook_service.process_webhook(verification)
+
+    except WebhookProcessingError as exc:
+        # Convert a known application-level error into an HTTP response.
+        # Keeping this translation at the API boundary prevents the service
+        # layer from depending directly on FastAPI's HTTPException.
         raise HTTPException(
-            status_code=400,
-            detail="Request body must be valid JSON.",
+            status_code=exc.status_code,
+            detail=exc.detail,
         ) from exc
-
-    # A GitHub push payload must be a JSON object containing repository
-    # and commit information.
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Webhook JSON must be an object.",
-        )
-
-    # Extract repository information to identify which project was updated.
-    repository = payload.get("repository")
-
-    if not isinstance(repository, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Missing or invalid repository information.",
-        )
-
-    # GitHub provides the repository in owner/repository format.
-    repository_name = repository.get("full_name")
-
-    if not isinstance(repository_name, str) or not repository_name:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing repository.full_name.",
-        )
-
-    # Read the Git reference to determine whether the event represents
-    # a branch push or a tag push.
-    branch_ref = payload.get("ref")
-
-    if not isinstance(branch_ref, str) or not branch_ref:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing or invalid ref.",
-        )
-
-    # Only branch pushes are reviewed. Tag pushes are ignored because
-    # they do not represent an update to a configured review branch.
-    if not branch_ref.startswith("refs/heads/"):
-        return {
-            "status": "ignored",
-            "reason": "not_a_branch_push",
-            "ref": branch_ref,
-            "delivery_id": delivery_id,
-        }
-
-    # Convert the full Git reference into its branch name.
-    # Example: refs/heads/main becomes main.
-    branch = branch_ref.removeprefix("refs/heads/")
-
-    # Restrict reviews to branches defined in the application settings.
-    # This prevents every branch push from automatically triggering reviews.
-    if branch not in ALLOWED_BRANCHES:
-        return {
-            "status": "ignored",
-            "reason": "branch_not_configured",
-            "branch": branch,
-            "allowed_branches": sorted(ALLOWED_BRANCHES),
-            "delivery_id": delivery_id,
-        }
-
-    # The 'after' field contains the commit SHA at the end of the push.
-    # This is the commit Checkmate will retrieve and review.
-    commit_sha = payload.get("after")
-
-    if not isinstance(commit_sha, str) or not commit_sha:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing target commit SHA in after field.",
-        )
-
-    # GitHub uses forty zeroes in the 'after' field when a branch is deleted.
-    # Such events do not contain a commit that needs to be reviewed.
-    if len(commit_sha) == 40 and set(commit_sha) == {"0"}:
-        return {
-            "status": "ignored",
-            "reason": "branch_deleted",
-            "branch": branch,
-            "delivery_id": delivery_id,
-        }
-
-    # Validate the SHA format before passing it to the GitHub API.
-    # A standard Git commit SHA contains exactly forty hexadecimal characters.
-    if len(commit_sha) != 40 or any(
-        character not in "0123456789abcdefABCDEF"
-        for character in commit_sha
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="The after field must contain a valid 40-character SHA.",
-        )
-
-    # Record the accepted push details to help trace the review process
-    # and troubleshoot failures using the GitHub delivery ID.
-    logger.info(
-        "Processing push: delivery=%s repository=%s branch=%s commit=%s",
-        delivery_id,
-        repository_name,
-        branch,
-        commit_sha,
-    )
-
-    # Step 1: Retrieve commit details and changed file contents from GitHub.
-    # The GitHub client handles communication with the GitHub REST API.
-    try:
-        async with GitHubClient() as github:
-            commit_data = await github.fetch_commit(
-                repository_name,
-                commit_sha,
-            )
-
-    # Invalid repository or commit inputs are treated as client-side errors.
-    except ValueError as exc:
-        logger.warning("Invalid GitHub retrieval input: %s", exc)
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid repository or commit information.",
-        ) from exc
-
-    # GitHub API failures are reported as gateway errors because Checkmate
-    # could not retrieve the commit from the external GitHub service.
-    except GitHubAPIError as exc:
-        logger.exception(
-            "GitHub retrieval failed for %s at %s",
-            repository_name,
-            commit_sha,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not retrieve the commit from GitHub. Check the "
-                "repository, commit SHA, API access, and GitHub API availability."
-            ),
-        ) from exc
-
-    # Build a safe summary of the changed files for the webhook response.
-    # Source code is not included; only file metadata and availability details
-    # are returned.
-    file_summaries = [
-        {
-            "path": item["path"],
-            "status": item["status"],
-            "additions": item["additions"],
-            "deletions": item["deletions"],
-            "changes": item["changes"],
-            "patch_available": bool(item.get("patch")),
-            "content_available": item.get("content") is not None,
-            "content_characters": len(item.get("content") or ""),
-        }
-        for item in commit_data["files"]
-    ]
-
-    # Log the number of changed files retrieved for this commit.
-    logger.info(
-        "Retrieved commit %s from %s: %d changed files",
-        commit_data["commit"],
-        repository_name,
-        len(file_summaries),
-    )
-
-    # Step 2: Pass the changed files to the review service.
-    # The review service filters unsupported files and sends eligible
-    # source code to the locally running Ollama model.
-    try:
-        review_result = await review_commit_files(
-            commit_data["files"]
-        )
-
-    # If the AI review fails, log the error and return a gateway response.
-    # The commit may have been retrieved successfully, but its review
-    # could not be completed.
-    except Exception as exc:
-        logger.exception(
-            "AI review failed for %s at %s",
-            repository_name,
-            commit_sha,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "The commit was retrieved, but the AI code review failed. "
-                "Check that Ollama is running and the configured model "
-                "is available."
-            ),
-        ) from exc
-
-    # Record the review totals to make it easier to monitor each run.
-    logger.info(
-        "AI review completed for %s: reviewed=%d skipped=%d",
-        repository_name,
-        review_result["reviewed_file_count"],
-        review_result["skipped_file_count"],
-    )
-
-    # Return commit metadata, file summaries, review reports,
-    # and details of files that were skipped by the review service.
-    return {
-        "status": "accepted",
-        "message": "GitHub commit retrieved and AI review completed.",
-        "delivery_id": delivery_id,
-        "repository": commit_data["repository"],
-        "branch": branch,
-        "commit": commit_data["commit"],
-        "commit_message": commit_data["message"],
-        "changed_file_count": len(file_summaries),
-        "files": file_summaries,
-        "reviewed_file_count": review_result["reviewed_file_count"],
-        "skipped_file_count": review_result["skipped_file_count"],
-        "reviews": review_result["reviews"],
-        "skipped_files": review_result["skipped_files"],
-    }

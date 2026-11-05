@@ -1,578 +1,275 @@
-# Checkmate ♟️
-### AI-Powered GitHub Code Review System
+# Checkmate — AI-Powered Code Review
 
-Checkmate is a local AI-powered code review application that automatically reviews code changes when a GitHub push event is received. It uses **FastAPI** to receive webhooks, the **GitHub REST API** to retrieve commit information and changed files, and **Ollama** to run a local large language model for code review.
+Checkmate is a Python/FastAPI application that receives GitHub push events, retrieves the associated commit and changed files, and uses a locally hosted Ollama model to generate code-review feedback.
 
-The goal of Checkmate is to help developers identify potential bugs, security vulnerabilities, performance issues, and maintainability concerns early in the development workflow.
+The current development setup uses **Qwen 2.5 Coder 3B** through Ollama. The application is organized as a modular monolith: API endpoints, application services, configuration, constants, and reusable utilities live in separate packages within one FastAPI application.
 
-> **Project status:** Working prototype. The core webhook-to-AI-review workflow has been tested locally. This is an educational and development project, not a replacement for professional code review or dedicated security analysis.
+> **Implementation note:** This README describes the current GitHub + FastAPI + Ollama development workflow. Features described as future work are not represented as completed functionality.
 
----
+## What Checkmate currently does
 
-## Table of Contents
+- Exposes a FastAPI health endpoint (`GET /health`).
+- Receives GitHub push-style webhook requests at `POST /webhooks/github`.
+- Verifies webhook authenticity using an HMAC-SHA256 signature and the configured webhook secret.
+- Filters events by configured branch names.
+- Retrieves commit information and changed-file data through the GitHub REST API.
+- Selects supported source files for review using centralized file-extension configuration.
+- Sends code to a locally running Ollama model and collects AI-generated review feedback.
+- Returns the processing/review response from the webhook endpoint.
 
-1. [Project Overview](#1-project-overview)
-2. [Key Features](#2-key-features)
-3. [Technology Stack](#3-technology-stack)
-4. [How Checkmate Works](#4-how-checkmate-works)
-5. [Project Structure](#5-project-structure)
-6. [Prerequisites](#6-prerequisites)
-7. [Installation and Setup](#7-installation-and-setup)
-8. [Configuration](#8-configuration)
-9. [Running the Application](#9-running-the-application)
-10. [Testing the Workflow](#10-testing-the-workflow)
-11. [API Endpoints](#11-api-endpoints)
-12. [Security Considerations](#12-security-considerations)
-13. [Current Limitations](#13-current-limitations)
-14. [Future Improvements](#14-future-improvements)
-15. [Architecture and Folder Structure Alignment](#15-architecture-and-folder-structure-alignment)
+The application does not currently require a database. The `database/` and `middleware/` packages are structural placeholders for future development.
 
----
+## Technology stack
 
-## 1. Project Overview
-
-Code reviews are an important part of software development, but manual reviews can take time and may overlook certain issues. Checkmate explores how a locally running AI model can assist with this process by reviewing changes associated with GitHub commits.
-
-When a configured GitHub push event reaches Checkmate, the application validates the webhook signature, checks whether the event should be processed, retrieves the relevant commit and changed-file information, and sends eligible code to the local AI model.
-
-The model's response is collected and returned as a structured HTTP response for inspection.
-
-### Project objectives
-
-- Automate the initial review of GitHub code changes.
-- Identify potential bugs and security weaknesses.
-- Use a locally running AI model instead of requiring a hosted LLM API for code review.
-- Separate webhook handling, GitHub communication, review orchestration, and AI interaction.
-- Provide a foundation for future improvements to review quality, reporting, and project architecture.
-
----
-
-## 2. Key Features
-
-### GitHub webhook integration
-
-- Provides a FastAPI endpoint to receive GitHub webhook requests.
-- Validates the webhook signature using HMAC-SHA256.
-- Filters events according to the application's configured repository, branch, and other processing conditions.
-- Retrieves commit information and changed-file details through the GitHub REST API.
-
-### AI-assisted code review
-
-- Uses Ollama to run a code-capable language model locally.
-- Sends eligible source-code changes to the model for review.
-- Collects the model's findings for inspection.
-- Supports recording files that were skipped by the review process.
-
-### Modular application design
-
-The current implementation separates the application into modules responsible for API handling, configuration, GitHub integration, review orchestration, AI communication, and webhook security.
-
-### Local testing support
-
-The `scripts/` directory contains utilities for exercising the webhook workflow and testing individual integrations without needing to trigger every scenario through GitHub.
-
----
-
-## 3. Technology Stack
-
-| Technology | Purpose |
+| Technology | Role |
 |---|---|
-| Python | Primary programming language |
-| FastAPI | Web application and HTTP endpoints |
-| Uvicorn | ASGI server used to run FastAPI |
-| GitHub REST API | Retrieves commit information and changed files |
-| Ollama | Runs the AI model locally |
-| Qwen2.5-Coder 3B | Local code-review model used during development |
-| HTTPX | Makes asynchronous HTTP requests |
-| python-dotenv | Loads environment variables from `.env` |
-| pytest | Can be used for automated Python tests |
+| Python | Application language |
+| FastAPI | HTTP API and webhook receiver |
+| Uvicorn | Local ASGI server |
+| GitHub REST API | Commit and changed-file retrieval |
+| HTTPX | Asynchronous HTTP communication |
+| Ollama | Local model runtime |
+| Qwen 2.5 Coder 3B | Configured code-review model |
+| Pytest | Automated tests |
+| python-dotenv | Loads local environment configuration |
 
-The model and its output are used as review assistance. Model findings require human verification.
-
----
-
-## 4. How Checkmate Works
-
-The following flow describes the intended processing path for a supported GitHub push event.
-
-```text
-Developer pushes code to GitHub
-              |
-              v
-      GitHub push webhook
-              |
-              v
-    FastAPI webhook endpoint
-              |
-              v
-    Verify webhook signature
-              |
-              v
-   Validate event and filters
-              |
-              v
-   Fetch commit from GitHub API
-              |
-              v
-  Identify eligible changed files
-              |
-              v
-     Review orchestrator
-              |
-              v
-      Local Ollama model
-              |
-              v
-     Collect review results
-              |
-              v
-       Return JSON response
-```
-
-### Step-by-step execution
-
-1. **Receive the event:** GitHub sends a push webhook to the application's webhook endpoint.
-2. **Verify authenticity:** The webhook handler checks the `X-Hub-Signature-256` header against the request body using the configured webhook secret.
-3. **Apply filters:** The application checks whether the event and repository, branch, and commit satisfy its processing conditions.
-4. **Retrieve commit details:** The GitHub client fetches the commit and relevant changed-file content.
-5. **Select files:** The review orchestrator determines which files are eligible for review and which should be skipped.
-6. **Generate a review:** The Ollama client sends the eligible code and review prompt to the locally running model.
-7. **Collect results:** The orchestrator gathers the review responses and skip information.
-8. **Return a response:** The webhook endpoint returns the processing results as JSON.
-
-**Important:** The local webhook simulation script is a test client. It constructs a sample push payload and signs it with the configured secret before sending it to the local FastAPI server. It is not part of GitHub's production webhook delivery mechanism.
-
----
-
-## 5. Project Structure
-
-The following is the current project structure. It reflects the implementation as it exists today, rather than the proposed future folder layout.
+## Project structure
 
 ```text
 checkmate_application/
-│
 ├── app/
-│   ├── __init__.py
 │   ├── main.py
-│   ├── config.py
-│   │
 │   ├── api/
 │   │   ├── __init__.py
-│   │   ├── github_webhook.py
-│   │   └── health.py
-│   │
-│   ├── integrations/
+│   │   ├── health.py
+│   │   └── github_webhook.py
+│   ├── services/
 │   │   ├── __init__.py
-│   │   └── github_client.py
-│   │
-│   ├── review/
-│   │   ├── orchestrator.py
-│   │   └── ollama_client.py
-│   │
-│   └── security/
-│       ├── __init__.py
-│       └── webhook_signature.py
-│
+│   │   ├── github_service.py
+│   │   ├── review_service.py
+│   │   └── ollama_service.py
+│   ├── database/
+│   │   └── __init__.py
+│   ├── constants/
+│   │   ├── __init__.py
+│   │   └── review.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   └── settings.py
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   └── webhook_signature.py
+│   └── middleware/
+│       └── __init__.py
 ├── scripts/
-│   ├── __init__.py
-│   ├── send_github_commit_webhook.py
-│   ├── send_test_webhook.py
-│   ├── test_github_client.py
-│   └── test_ollama.py
-│
 ├── tests/
-│   ├── test_signature.py
-│   └── test_case_02_payment_api.py
-│
 ├── .env.example
 ├── .gitignore
-├── PROJECT_STATUS.md
+├── requirements.txt
 ├── README.md
-└── requirements.txt
+└── PROJECT_STATUS.md
 ```
 
-### Responsibilities of the main files and folders
+### Application modules
 
-#### `app/main.py` — Application entry point
+| Module | Responsibility |
+|---|---|
+| `app/main.py` | Creates the FastAPI application and registers its routers. |
+| `app/api/health.py` | Implements the health-check endpoint. |
+| `app/api/github_webhook.py` | Receives webhook requests, validates/filters events, and delegates review processing. |
+| `app/services/github_service.py` | Communicates with the GitHub REST API to retrieve commit and changed-file information. Its HTTPX client follows redirects. |
+| `app/services/review_service.py` | Coordinates changed-file processing and the review workflow. |
+| `app/services/ollama_service.py` | Sends review requests to the locally hosted Ollama model and handles its response. |
+| `app/config/settings.py` | Loads and exposes application settings from environment configuration. |
+| `app/constants/review.py` | Centralizes the supported file extensions used to select reviewable files. |
+| `app/utils/webhook_signature.py` | Contains reusable GitHub webhook signature-verification logic. |
+| `app/database/` | Reserved for future persistence functionality; no database is currently required. |
+| `app/middleware/` | Reserved for future cross-cutting HTTP middleware. |
 
-Creates the FastAPI application and registers the API routers.
+The `__init__.py` files make these directories importable Python packages. They do not necessarily contain runtime logic.
 
-#### `app/api/` — API routes
+## Request and review flow
 
-- `github_webhook.py`: Receives GitHub webhook events and coordinates the request-processing flow.
-- `health.py`: Exposes a health endpoint for checking whether the application is running.
-
-#### `app/integrations/` — External integrations
-
-- `github_client.py`: Communicates with the GitHub REST API to retrieve commit information and changed-file content.
-
-#### `app/review/` — Review logic
-
-- `orchestrator.py`: Coordinates file selection, review execution, and collection of review results.
-- `ollama_client.py`: Communicates with the local Ollama API and extracts the model's review response.
-
-#### `app/security/` — Security utilities
-
-- `webhook_signature.py`: Verifies the webhook signature using HMAC-SHA256.
-
-#### `app/config.py` — Application configuration
-
-Loads the application's environment-based configuration, including the settings required by the integrations and webhook processing.
-
-#### `scripts/` — Development and integration test utilities
-
-- `send_github_commit_webhook.py`: Sends a signed, simulated push event to the local application.
-- `send_test_webhook.py`: Exercises webhook filtering with a test event.
-- `test_github_client.py`: Tests the GitHub client independently.
-- `test_ollama.py`: Tests the Ollama client independently.
-
-#### `tests/` — Test cases and fixtures
-
-- `test_signature.py`: Contains automated tests for webhook signature verification.
-- `test_case_02_payment_api.py`: Contains an intentionally vulnerable payment API fixture for demonstrating AI-assisted code review. It is not a production payment implementation.
-
-#### `.env.example`
-
-Provides a template for the environment variables required to configure a local instance.
-
-#### `.env`
-
-Stores local environment-specific settings and secrets. This file should remain local and must not be committed to Git.
-
-#### `requirements.txt`
-
-Lists the Python dependencies needed by the application.
-
----
-
-## 6. Prerequisites
-
-Before running Checkmate, ensure the following are available:
-
-- Python installed on your system.
-- Git installed and configured.
-- A local Ollama installation.
-- A code-capable Ollama model downloaded.
-- Access to the GitHub repository whose commits you want to review.
-- A configured `.env` file with the values required by the application.
-
-The current development setup uses the `qwen2.5-coder:3b` model.
-
----
-
-## 7. Installation and Setup
-
-### Step 1: Clone the repository
-
-```bash
-git clone https://github.com/aryadoshii-nusummit/checkmate-application.git
-cd checkmate-application
+```text
+Developer pushes a commit to GitHub
+                |
+                v
+        GitHub push webhook
+                |
+                v
+   FastAPI: POST /webhooks/github
+                |
+                v
+     Verify webhook signature
+                |
+                v
+       Check allowed branch
+                |
+                v
+       GitHub service retrieves
+       commit and changed files
+                |
+                v
+       Review service selects
+       supported files and coordinates review
+                |
+                v
+       Ollama service sends code
+       to Qwen 2.5 Coder 3B
+                |
+                v
+       AI-generated review response
+                |
+                v
+       Webhook response
 ```
 
-### Step 2: Create a virtual environment
+The API layer handles HTTP requests and responses. The service layer contains the application operations. The utility layer provides reusable signature verification, while configuration and constants are kept separate from business logic.
 
-On Windows PowerShell:
+## Prerequisites
+
+- Windows with PowerShell (the commands below use PowerShell syntax).
+- Python installed.
+- Git installed.
+- Ollama installed and running locally.
+- The configured Ollama model pulled locally.
+- GitHub access to the repository and commit being tested.
+
+For the current local model setup:
 
 ```powershell
-python -m venv .venv
+ollama pull qwen2.5-coder:3b
+ollama list
 ```
 
-Activate it:
+The local Ollama endpoint is typically `http://localhost:11434`.
+
+## Local setup
+
+Run these commands from the repository root:
 
 ```powershell
+py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks script activation, you can use the environment's Python executable directly instead:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-### Step 3: Install dependencies
-
-If the virtual environment is activated:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-### Step 4: Configure environment variables
-
-Create a local `.env` file by copying the example:
-
-```powershell
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and supply the required values for your environment. Refer to `.env.example` and `app/config.py` for the actual setting names and expected formats.
+If PowerShell prevents virtual-environment activation, allow it for the current terminal session and retry:
 
-Do not copy real secrets into `.env.example` or commit `.env` to GitHub.
-
-### Step 5: Install and start Ollama
-
-Install Ollama from its official website:
-
-https://ollama.com/
-
-Download the model used for development:
-
-```bash
-ollama pull qwen2.5-coder:3b
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
-Ollama normally exposes its local API at:
+### Environment configuration
 
-```text
-http://localhost:11434
+Set the required values in the local `.env` file. Do not commit `.env` or share its secret values.
+
+The configuration used by the current development/test setup includes:
+
+| Variable | Purpose |
+|---|---|
+| `GITHUB_WEBHOOK_SECRET` | Shared secret used to verify webhook signatures. |
+| `CHECKMATE_ALLOWED_BRANCHES` | Comma-separated branch allow-list. |
+| `CHECKMATE_TEST_REPOSITORY` | Repository used by the commit-webhook test. |
+| `CHECKMATE_TEST_BRANCH` | Branch used by the commit-webhook test. |
+| `CHECKMATE_TEST_COMMIT` | Commit SHA used by the commit-webhook test. |
+| `OLLAMA_BASE_URL` | Ollama API base URL; local setup uses `http://localhost:11434`. |
+| `OLLAMA_MODEL` | Model name; current setup uses `qwen2.5-coder:3b`. |
+| `OLLAMA_TIMEOUT_SECONDS` | Intended timeout configuration for Ollama requests. |
+
+Use `.env.example` as the authoritative template for the exact variable names and any additional settings required by the checked-out branch. Generate a strong webhook secret for local use, and configure the same value in the GitHub webhook settings when using real GitHub deliveries.
+
+A GitHub token may be needed for private repositories or API access beyond unauthenticated public access. Use only the minimum required permissions and keep tokens out of source control.
+
+## Run the application
+
+Start Ollama in the background, then start FastAPI from the repository root:
+
+```powershell
+uvicorn app.main:app --reload --port 8000
 ```
 
-Ensure Ollama is running and the model is available before triggering a code review.
+Useful local endpoints:
 
----
+- Health check: `http://127.0.0.1:8000/health`
+- Interactive API documentation: `http://127.0.0.1:8000/docs`
+- GitHub webhook endpoint: `http://127.0.0.1:8000/webhooks/github`
 
-## 8. Configuration
+Keep the server terminal running while executing the test scripts in a second PowerShell terminal.
 
-Checkmate uses environment variables to separate machine-specific settings and secrets from application code.
+## Tests and local verification
 
-The `.env.example` file is the reference template for local configuration.
+Run the automated test suite:
 
-Typical configuration categories include:
-
-- GitHub repository, branch, and commit settings for test scenarios.
-- GitHub API authentication settings, if required by the current client configuration.
-- The GitHub webhook secret used to verify incoming signatures.
-- Ollama's local API endpoint and model selection.
-- HTTP timeout settings for longer AI review requests.
-
-Use the exact variable names documented in `.env.example` and loaded by `app/config.py`. Do not assume that every optional setting is enabled in every configuration.
-
-### Security reminder
-
-Never publish GitHub tokens, webhook secrets, or other credentials. Keep them in `.env` or a suitable secret-management system and ensure they are excluded by `.gitignore`.
-
----
-
-## 9. Running the Application
-
-Open a terminal in the project directory and activate the virtual environment.
-
-Start the FastAPI server:
-
-```bash
-python -m uvicorn app.main:app --reload
+```powershell
+python -m pytest -q
 ```
 
-The local application will normally be available at:
+Check that the application imports successfully:
 
-```text
-http://127.0.0.1:8000
+```powershell
+python -c "from app.main import app; print('Checkmate application imports successfully')"
 ```
 
-The `--reload` option is intended for development. It automatically restarts the server when source files change.
+Run the standalone Ollama smoke test:
 
-### Interactive API documentation
-
-FastAPI typically exposes interactive documentation at:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-Use the documented endpoints to inspect the application's available API routes.
-
-Keep the server running while you execute the webhook simulation scripts in a second terminal.
-
----
-
-## 10. Testing the Workflow
-
-Checkmate includes utilities for testing individual integrations and the end-to-end local webhook flow.
-
-### Test the GitHub client
-
-```bash
-python -m scripts.test_github_client
-```
-
-This utility exercises GitHub commit retrieval independently of the webhook simulation.
-
-### Test the Ollama client
-
-```bash
+```powershell
 python -m scripts.test_ollama
 ```
 
-This utility checks communication with the local Ollama model.
+Send a signed test webhook to check webhook receipt, signature verification, and branch filtering:
 
-### Test webhook filtering
-
-```bash
+```powershell
 python -m scripts.send_test_webhook
 ```
 
-This utility sends a test webhook designed to exercise the configured branch or event filters.
+The supplied test branch is intentionally unconfigured, so an `ignored` response with `reason: branch_not_configured` is an expected result for that test.
 
-### Run the end-to-end local webhook simulation
+For a commit-based integration test, keep FastAPI running and configure `CHECKMATE_TEST_REPOSITORY`, `CHECKMATE_TEST_BRANCH`, and `CHECKMATE_TEST_COMMIT` in `.env`. Then run:
 
-With the FastAPI server running in a separate terminal:
-
-```bash
+```powershell
 python -m scripts.send_github_commit_webhook
 ```
 
-This script builds and signs a simulated GitHub push payload, sends it to the local webhook endpoint, and prints the resulting response.
+This script sends a signed simulated push event to the local webhook endpoint using the configured test repository and commit. It does not require a public HTTPS tunnel. A successful run should return the review response for the configured commit. Review duration depends on the files and local model performance.
 
-The script depends on the appropriate test repository, branch, commit, webhook secret, and other required configuration being present in `.env`.
+## Refactoring summary
 
-### Run the automated signature tests
+The branch `refactor/manager-project-structure` reorganizes the application into the agreed package layout. The main file moves were:
 
-```bash
-python -m pytest tests/test_signature.py -v
-```
+| Previous path | Current path |
+|---|---|
+| `app/config.py` | `app/config/settings.py` |
+| `app/integrations/github_client.py` | `app/services/github_service.py` |
+| `app/review/orchestrator.py` | `app/services/review_service.py` |
+| `app/review/ollama_client.py` | `app/services/ollama_service.py` |
+| `app/security/webhook_signature.py` | `app/utils/webhook_signature.py` |
 
-If pytest is not installed in the environment, install it before running this command.
+Imports were updated to use the new paths, including the signature test import. The refactor also introduced `app/constants/review.py` with the supported file-extension list and added the `database/` and `middleware/` placeholders.
 
-### Test the review fixture
+The GitHub HTTP client was configured with `follow_redirects=True` after an API request returned a permanent redirect for the test repository endpoint.
 
-`tests/test_case_02_payment_api.py` is a deliberately insecure sample used to demonstrate what Checkmate may flag during a code review. It is a review target, not a test that should be deployed as a real payment service.
+## Current status and limitations
 
----
+The development workflow has been exercised through application import checks, the health endpoint, the test suite, standalone Ollama testing, webhook signature/branch-filter testing, and a commit-based webhook review. The recorded automated test run completed with **5 passing tests**.
 
-## 11. API Endpoints
+Known considerations:
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/health` | `GET` | Health check, as registered by the health router |
-| `/webhooks/github` | `POST` | Receives GitHub webhook events |
+- Local Ollama response time can vary. A full webhook review previously encountered an HTTPX read timeout, although a subsequent run was reported to return review results. Timeout behavior and long-running review handling should be validated further.
+- The `database/` and `middleware/` directories are placeholders, not implemented subsystems.
+- The current integration test uses a configured test repository and commit; update those values when testing a different commit.
+- AI feedback should be treated as review assistance and checked by a developer.
 
-The health route's exact response format is defined in `app/api/health.py`.
+## Future improvements
 
-The webhook endpoint expects a GitHub-compatible webhook request, including the relevant signature header. Its response reports the outcome of processing the event, including review information or filtering results as implemented by the application.
+Potential next steps, subject to project requirements and manager review:
 
-Check `/docs` while the application is running for the registered paths and their current request and response schemas.
-
----
-
-## 12. Security Considerations
-
-Security is an important focus of Checkmate, but the application is still a prototype.
-
-### Webhook signature verification
-
-The application verifies `X-Hub-Signature-256` against the raw request body using the configured shared secret and HMAC-SHA256.
-
-Signature verification helps detect requests that do not have a valid signature for the configured secret. It should be complemented by appropriate webhook configuration, delivery checks, and operational controls.
-
-### Secrets and configuration
-
-- Do not commit `.env`.
-- Do not place live credentials in source files or example configuration.
-- Use appropriately scoped credentials when authentication is needed.
-- Rotate any credential that has been exposed.
-
-### AI-generated findings
-
-An AI review is not proof that a vulnerability exists or that code is safe.
-
-The model may:
-
-- Report an issue that is not present in the code.
-- Miss a genuine vulnerability.
-- Misunderstand surrounding application context.
-- Produce inconsistent recommendations.
-
-Treat its output as a list of suggestions for human verification. Findings should be checked against the actual source code and application requirements.
-
-### Vulnerable test fixture
-
-The payment API fixture is intentionally insecure for review demonstrations. It must not be used as a real payment implementation or deployed as a production service.
-
-### Development server
-
-Uvicorn's `--reload` option is for local development, not production deployment. A production setup would require additional deployment, access-control, logging, monitoring, and security considerations.
-
----
-
-## 13. Current Limitations
-
-The current implementation is a working prototype and has the following limitations:
-
-- Review quality depends on the local model and the quality of the prompt.
-- Model responses can contain false positives or false negatives.
-- Large files or complex changes may require more processing time and careful timeout configuration.
-- The current flow is designed around webhook-triggered review and does not yet provide a full review dashboard.
-- A database-backed review history is not currently part of the documented project structure.
-- The application does not replace a complete security testing pipeline, static analysis, or human review.
-- The current code structure may be reorganized to match the agreed project architecture.
-
----
-
-## 14. Future Improvements
-
-Potential future enhancements include:
-
-- Posting review summaries directly to GitHub pull requests or commit discussions.
-- Producing more structured findings with severity, file, line number, and remediation suggestions.
-- Adding safeguards against unsupported or hallucinated findings.
-- Introducing a persistent database for review history and execution status.
-- Supporting configurable file exclusions and review policies.
-- Adding stronger automated integration and end-to-end tests.
-- Improving timeout handling, retries, and error reporting.
-- Adding structured logging and observability.
-- Supporting deployment beyond a local development environment.
-
-These are planned improvements, not claims about currently implemented functionality.
-
----
-
-## 15. Architecture and Folder Structure Alignment
-
-**Status: To be discussed and implemented following manager feedback.**
-
-The current implementation uses an `app/` package containing API routes, integrations, review logic, security utilities, and configuration.
-
-The proposed organizational direction is to align the project with the following responsibility-based structure:
-
-```text
-checkmate_application/
-│
-├── main/          # Application entry point
-├── api/           # HTTP endpoints and route handlers
-├── services/      # Application logic and external integrations
-├── database/      # Database access and persistence, when introduced
-├── constants/     # Shared static values and constants
-├── config/        # Application configuration
-│
-├── scripts/       # Development and integration test utilities
-├── tests/         # Automated tests and review fixtures
-│
-├── .env.example
-├── .gitignore
-├── README.md
-└── requirements.txt
-```
-
-This is a **proposed target structure**, not the current directory layout.
-
-The exact responsibilities and placement of modules will be reviewed with the manager before making the changes. In particular:
-
-- Existing API route handlers will be mapped to the API layer.
-- Review orchestration and integration logic will be mapped to the services layer.
-- Configuration and shared constants will be separated where appropriate.
-- A database layer will be introduced if and when persistence is required.
-- The application entry point and imports will be updated as needed during an approved migration.
-
-The reorganization will preserve existing application behavior as far as possible, with appropriate import updates and regression tests to ensure the webhook-to-review workflow continues to work.
-
----
-
-## 16. Project Summary
-
-Checkmate demonstrates an end-to-end approach to AI-assisted code review using GitHub webhooks, FastAPI, the GitHub REST API, and a locally hosted Ollama model.
-
-Its current focus is to establish the core workflow, keep responsibilities separated, and provide a foundation for further improvements.
-
-The next architectural step is to review the proposed folder structure with the manager and then implement the agreed changes carefully, without disrupting the existing functionality.
-
-**Repository:** https://github.com/aryadoshii-nusummit/checkmate-application
+- Improve timeout handling and processing of long-running reviews.
+- Add broader automated tests for GitHub API errors and Ollama failures.
+- Improve structured review-result validation and reporting.
+- Add persistence if review history or delivery tracking becomes necessary.
+- Implement middleware when concrete logging, tracing, or request-handling requirements are defined.
+- Extend review capabilities only after confirming the required scope and acceptance criteria.
