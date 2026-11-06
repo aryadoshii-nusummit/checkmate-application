@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import unittest
 
-from app.security.webhook_signature import verify_github_signature
+from app.utils.webhook_signature import verify_github_signature
 
 
 class WebhookSignatureTests(unittest.TestCase):
@@ -40,3 +40,6 @@ class WebhookSignatureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
