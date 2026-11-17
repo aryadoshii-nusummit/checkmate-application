@@ -1,4 +1,3 @@
-
 """
 Ollama-powered code review service for Checkmate.
 
@@ -10,12 +9,14 @@ defects across correctness, security, business logic, reliability,
 performance, and maintainability.
 """
 
+import json
 import logging
 from typing import Any
 
 import httpx
 
 from app.config import settings
+from app.models.review import ReviewResult
 
 
 logger = logging.getLogger(__name__)
@@ -299,63 +300,50 @@ These are examples, not assumptions. Recommend them only when supported
 by the implementation.
 
 ==================================================
-10. REVIEW OUTPUT
+10. STRUCTURED REVIEW OUTPUT
 ==================================================
 
-Return only the following Markdown structure.
+Return one valid JSON object only. Do not use Markdown fences,
+explanatory text, or additional keys.
 
-## Review Summary
+Use exactly this structure:
 
-Briefly explain the file's likely responsibility and overall quality.
+{
+  "summary": "Balanced explanation of the file purpose and review result.",
+  "overall_quality": "GOOD | ACCEPTABLE | NEEDS IMPROVEMENT",
+  "strengths": [
+    "Specific positive observations."
+  ],
+  "areas_to_improve": [
+    "Specific weaknesses, if any."
+  ],
+  "findings": [
+    {
+      "title": "Descriptive finding title",
+      "severity": "CRITICAL | HIGH | MEDIUM | LOW | INFO",
+      "confidence": "HIGH | MEDIUM",
+      "category": "Security | Correctness | Reliability | Performance | Maintainability | Other",
+      "line_numbers": [12],
+      "evidence": "Exact code or behavior demonstrating the issue.",
+      "problem": "Why it is wrong and under what realistic conditions.",
+      "impact": "The practical consequence.",
+      "recommendation": "A focused correction addressing the root cause."
+    }
+  ],
+  "additional_suggestions": [
+    "Useful optional improvements not already covered by findings."
+  ]
+}
 
-State one of:
-
-GOOD
-ACCEPTABLE
-NEEDS IMPROVEMENT
-
-Give a balanced summary of its strongest aspects and its most important
-confirmed weaknesses, if any.
-
-Do not claim to have assessed the entire application from one file.
-
-## Quality Assessment
-
-- **Overall:** GOOD / ACCEPTABLE / NEEDS IMPROVEMENT
-- **Strengths:** Specific positive observations.
-- **Areas to improve:** Specific weaknesses, or state that no significant
-  improvements were identified.
-
-## Findings
-
-For each distinct confirmed issue, use:
-
-### [Descriptive finding title]
-
-- **Severity:** CRITICAL / HIGH / MEDIUM / LOW
-- **Confidence:** HIGH / MEDIUM
-- **Category:** Security / Correctness / Reliability / Performance /
-  Maintainability / Other
-- **Location:** Exact source line number(s).
-- **Evidence:** Specific code or behavior demonstrating the issue.
-- **Problem:** Why it is wrong and under what realistic conditions.
-- **Impact:** The practical consequence.
-- **Recommendation:** A focused correction addressing the root cause.
-
-If there are no confirmed defects, write:
-
-No significant issues identified in the supplied code.
-
-## Additional Suggestions
-
-Include useful optional improvements that are not already covered
-by the findings.
-
-Do not repeat recommendations from findings.
-
-If there are no distinct suggestions, write:
-
-No additional suggestions.
+Rules:
+- Use an empty array when a section has no entries.
+- Every finding must have at least one exact source line number.
+- Never invent line numbers or report lines outside the supplied file.
+- Do not create findings for personal style preferences.
+- Do not repeat a finding as an additional suggestion.
+- If there are no confirmed defects, return an empty findings array.
+- Keep the summary, quality assessment, and findings consistent.
+- Do not claim to have assessed the entire application from one file.
 
 ==================================================
 11. FINAL REVIEW CHECK
@@ -429,12 +417,16 @@ SOURCE CODE:
 {numbered_lines}
 ```
 
-Follow the required Markdown review structure.
+Return only a valid JSON object matching the required structured review schema. Do not wrap it in Markdown.
 """.strip()
 
     @staticmethod
-    def _extract_review(response_data: Any) -> str:
-        """Validate and extract the generated review from Ollama's response."""
+    def _extract_review(
+        response_data: Any,
+        source_line_count: int,
+    ) -> ReviewResult:
+        """Parse and validate Ollama's structured review response."""
+
         if not isinstance(response_data, dict):
             raise RuntimeError("Ollama returned an invalid response structure.")
 
@@ -450,9 +442,30 @@ Follow the required Markdown review structure.
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("Ollama returned an empty code review.")
 
-        return content.strip()
+        try:
+            result = ReviewResult.model_validate_json(content)
+        except Exception as exc:
+            raise RuntimeError(
+                "Ollama returned a review that does not match "
+                "the required structured format."
+            ) from exc
 
-    async def review_code(self, file_path: str, code: str) -> str:
+        for finding in result.findings:
+            invalid_lines = [
+                number
+                for number in finding.line_numbers
+                if number > source_line_count
+            ]
+
+            if invalid_lines:
+                raise RuntimeError(
+                    "Ollama returned line numbers outside the source file: "
+                    f"{invalid_lines}"
+                )
+
+        return result
+
+    async def review_code(self, file_path: str, code: str) -> ReviewResult:
         """
         Review a source file using the configured Ollama model.
 
@@ -461,7 +474,7 @@ Follow the required Markdown review structure.
             code: Complete source code to analyze.
 
         Returns:
-            Markdown-formatted code review generated by Ollama.
+            Validated structured review generated by Ollama.
 
         Raises:
             ValueError: If the file path or source code is empty.
@@ -491,6 +504,7 @@ Follow the required Markdown review structure.
                 },
             ],
             "stream": False,
+            "format": "json",
             "options": {
                 "temperature": 0.1,
                 "num_ctx": 4096,
@@ -523,13 +537,20 @@ Follow the required Markdown review structure.
                     "Ollama returned an invalid response structure."
                 )
 
-            if response_data.get("done") is False:
-                logger.warning(
-                    "Ollama reported an incomplete response for '%s'.",
-                    file_path,
+            if (
+                response_data.get("done") is False
+                or response_data.get("done_reason") == "length"
+            ):
+                raise RuntimeError(
+                    "Ollama returned an incomplete review for "
+                    f"'{file_path}'. The response may have reached "
+                    "the generation limit."
                 )
 
-            review = self._extract_review(response_data)
+            review = self._extract_review(
+                response_data,
+                source_line_count=len(code.splitlines()),
+            )
 
             logger.info(
                 "Code review completed for '%s'.",

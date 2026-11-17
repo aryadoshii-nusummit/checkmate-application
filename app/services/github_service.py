@@ -156,9 +156,16 @@ class GitHubClient:
             files.append(result)
 
         # Return the commit information in Checkmate's expected format.
+        commit_author = (
+            commit.get("commit", {})
+            .get("author", {})
+            .get("name")
+        )
+
         return {
             "repository": repository,
             "commit": resolved_sha,
             "message": commit.get("commit", {}).get("message", ""),
+            "commit_author": commit_author,
             "files": files,
         }

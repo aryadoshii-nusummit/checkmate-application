@@ -1,38 +1,33 @@
-"""Pydantic models used by the GitHub webhook API.
+"""Pydantic models used by the GitHub webhook API."""
 
-These models define the structure of incoming GitHub push data and
-outgoing Checkmate webhook responses.
-"""
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 
 class GitHubRepository(BaseModel):
-    """Repository information included in a GitHub push payload."""
+    """Identify the repository associated with a GitHub event."""
 
-    # GitHub identifies a repository using the owner/repository format.
-    # min_length=1 prevents an empty repository name from being accepted.
     full_name: str = Field(min_length=1)
 
 
-class GitHubPushPayload(BaseModel):
-    """The GitHub push-payload fields required by Checkmate."""
+class GitHubSender(BaseModel):
+    """Represent the GitHub account that triggered the webhook."""
 
-    # Only the fields needed by Checkmate are declared here.
-    # GitHub sends additional fields, which Pydantic ignores by default.
-    # min_length=1 ensures these required values are not empty strings.
+    login: str = Field(min_length=1)
+
+
+class GitHubPushPayload(BaseModel):
+    """Validate the relevant fields in a GitHub push event."""
+
     repository: GitHubRepository
     ref: str = Field(min_length=1)
     after: str = Field(min_length=1)
+    sender: GitHubSender | None = None
 
 
 class WebhookVerification(BaseModel):
-    """Result produced after authenticating and checking a webhook.
-
-    This is an internal dependency result, not the public API response.
-    It carries the information the route needs without repeating
-    signature, branch, or commit validation.
-    """
+    """Carry validated webhook metadata from the API dependency."""
 
     event_name: str
     delivery_id: str
@@ -40,16 +35,13 @@ class WebhookVerification(BaseModel):
     ref: str | None = None
     branch: str | None = None
     commit_sha: str | None = None
-
-    # A value here means the webhook is valid but should not trigger a review.
+    updated_by: str | None = None
     ignored_reason: str | None = None
-
-    # Included when the branch is not configured, to explain why it was ignored.
     allowed_branches: list[str] = Field(default_factory=list)
 
 
 class ChangedFileSummary(BaseModel):
-    """Safe metadata about a changed file returned by the webhook."""
+    """Summarize a changed file retrieved from GitHub."""
 
     path: str
     status: str
@@ -62,30 +54,33 @@ class ChangedFileSummary(BaseModel):
 
 
 class FileReview(BaseModel):
-    """AI review report for one changed file."""
+    """Represent the structured review of one source file."""
 
     path: str
     status: str
     review: str
+    quality: str | None = None
+    summary: str | None = None
+    strengths: list[str] = Field(default_factory=list)
+    areas_to_improve: list[str] = Field(default_factory=list)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    additional_suggestions: list[str] = Field(default_factory=list)
+    issues_count: int = 0
+    warnings_count: int = 0
+    suggestions_count: int = 0
 
 
 class SkippedFile(BaseModel):
-    """Information about a file that the review service did not process."""
+    """Explain why a changed file was not reviewed."""
 
     path: str
     reason: str
-
-    # These fields are populated when a file exceeds the configured line limit.
     line_count: int | None = None
     line_limit: int | None = None
 
 
 class GitHubWebhookResponse(BaseModel):
-    """Public response returned by the GitHub webhook endpoint.
-
-    Optional fields allow this model to represent both ignored events
-    and successfully completed reviews without changing existing responses.
-    """
+    """Return the outcome and review results of a GitHub webhook."""
 
     status: str
     message: str | None = None
@@ -94,15 +89,12 @@ class GitHubWebhookResponse(BaseModel):
     ref: str | None = None
     allowed_branches: list[str] | None = None
     delivery_id: str | None = None
-
     repository: str | None = None
     branch: str | None = None
     commit: str | None = None
     commit_message: str | None = None
-
     changed_file_count: int | None = None
     files: list[ChangedFileSummary] | None = None
-
     reviewed_file_count: int | None = None
     skipped_file_count: int | None = None
     reviews: list[FileReview] | None = None

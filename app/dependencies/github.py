@@ -189,4 +189,5 @@ async def verify_github_webhook(
         ref=branch_ref,
         branch=branch,
         commit_sha=commit_sha,
+        updated_by=payload.sender.login if payload.sender else None,
     )

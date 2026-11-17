@@ -1,4 +1,5 @@
-"""Coordinate AI code reviews for changed files in a GitHub commit."""
+
+"""Coordinate structured AI code reviews for changed GitHub files."""
 
 import logging
 import os
@@ -6,11 +7,82 @@ from typing import Any
 
 from app.config.settings import LINE_LIMIT
 from app.constants.review import REVIEWABLE_EXTENSIONS
+from app.models.review import ReviewResult
 from app.services.ollama_service import OllamaClient
 
-
-# Create a module-level logger to record errors during AI code reviews.
 logger = logging.getLogger(__name__)
+
+
+def _format_review_report(result: ReviewResult) -> str:
+    """Convert a validated review result into a readable Markdown report."""
+
+    sections = [
+        "## Review Summary",
+        result.summary,
+        f"**Overall quality:** {result.overall_quality}",
+    ]
+
+    if result.strengths:
+        sections.extend(["\n## Strengths"])
+        sections.extend(f"- {item}" for item in result.strengths)
+
+    if result.areas_to_improve:
+        sections.extend(["\n## Areas to Improve"])
+        sections.extend(f"- {item}" for item in result.areas_to_improve)
+
+    sections.append("\n## Findings")
+
+    if not result.findings:
+        sections.append("No significant issues identified in the supplied code.")
+    else:
+        for finding in result.findings:
+            lines = ", ".join(str(number) for number in finding.line_numbers)
+
+            sections.extend([
+                f"\n### {finding.title}",
+                (
+                    f"**Severity:** {finding.severity} | "
+                    f"**Confidence:** {finding.confidence} | "
+                    f"**Category:** {finding.category}"
+                ),
+                f"**Lines:** {lines}",
+                f"**Evidence:** {finding.evidence}",
+                f"**Problem:** {finding.problem}",
+                f"**Impact:** {finding.impact}",
+                f"**Recommendation:** {finding.recommendation}",
+            ])
+
+    if result.additional_suggestions:
+        sections.append("\n## Additional Suggestions")
+        sections.extend(
+            f"- {suggestion}"
+            for suggestion in result.additional_suggestions
+        )
+
+    return "\n\n".join(sections)
+
+
+def _count_findings(result: ReviewResult) -> dict[str, int]:
+    """Calculate consistent issue, warning, and suggestion totals."""
+
+    issues = sum(
+        finding.severity in {"CRITICAL", "HIGH", "MEDIUM"}
+        for finding in result.findings
+    )
+    warnings = sum(
+        finding.severity == "LOW"
+        for finding in result.findings
+    )
+    suggestions = (
+        sum(finding.severity == "INFO" for finding in result.findings)
+        + len(result.additional_suggestions)
+    )
+
+    return {
+        "issues_count": issues,
+        "warnings_count": warnings,
+        "suggestions_count": suggestions,
+    }
 
 
 async def review_commit_files(
@@ -19,40 +91,19 @@ async def review_commit_files(
     """
     Review eligible files from a GitHub commit using Ollama.
 
-    Files are checked for supported extensions, available text content,
-    binary data, and the configured line limit before being reviewed.
-
-    Args:
-        files: Changed-file information returned by the GitHub service.
-
-    Returns:
-        dict[str, Any]: Review reports, reviewed-file count,
-        skipped-file count, and details of skipped files.
+    Each eligible file receives a validated structured review. Files that
+    cannot be reviewed are reported explicitly rather than silently ignored.
     """
 
-    # Initialize the Ollama client used to generate code review reports.
     client = OllamaClient()
+    reviews: list[dict[str, Any]] = []
+    skipped_files: list[dict[str, Any]] = []
 
-    # Keep successful reviews and skipped-file details separately
-    # so the final response clearly explains what was processed.
-    reviews = []
-    skipped_files = []
-
-    # Read the maximum allowed file length from central configuration.
-    # Files exceeding this limit are skipped to control model input size.
-    line_limit = LINE_LIMIT
-
-    # Process each changed file retrieved from the GitHub commit.
     for file in files:
         path = file.get("path", "")
         content = file.get("content")
-
-        # Extract the file extension and normalize it to lowercase.
-        # This ensures that extensions such as .PY and .py are treated equally.
         extension = os.path.splitext(path)[1].lower()
 
-        # Skip files whose extensions are not supported by the review process.
-        # The supported extensions are maintained centrally in constants/review.py.
         if extension not in REVIEWABLE_EXTENSIONS:
             skipped_files.append({
                 "path": path,
@@ -60,8 +111,6 @@ async def review_commit_files(
             })
             continue
 
-        # Skip files when GitHub did not provide readable source content.
-        # Empty files are also excluded because there is no useful code to review.
         if not isinstance(content, str) or not content.strip():
             skipped_files.append({
                 "path": path,
@@ -69,8 +118,6 @@ async def review_commit_files(
             })
             continue
 
-        # Check for null bytes, which commonly indicate binary file content.
-        # Binary data should not be passed to a language model as source code.
         if "\x00" in content:
             skipped_files.append({
                 "path": path,
@@ -78,46 +125,50 @@ async def review_commit_files(
             })
             continue
 
-        # Count the file's lines before sending it to Ollama.
-        # This protects the review workflow from processing files
-        # larger than the configured limit.
         lines = content.splitlines()
 
-        if len(lines) > line_limit:
+        if len(lines) > LINE_LIMIT:
             skipped_files.append({
                 "path": path,
                 "reason": "file_exceeds_line_limit",
                 "line_count": len(lines),
-                "line_limit": line_limit,
+                "line_limit": LINE_LIMIT,
             })
             continue
 
-        # Send the eligible file to Ollama for AI-powered code review.
-        # The file path provides context, while the content contains
-        # the source code that needs to be analyzed.
         try:
-            report = await client.review_code(
+            result = await client.review_code(
                 file_path=path,
                 code=content,
             )
-
-        # Log the failing file and preserve the exception.
-        # Re-raising allows the webhook layer to return an appropriate
-        # error response instead of silently treating a failed review as skipped.
         except Exception:
             logger.exception("AI review failed for file %s", path)
             raise
 
-        # Store the generated report together with the file path and
-        # GitHub change status for identification in the final response.
+        counts = _count_findings(result)
+
         reviews.append({
             "path": path,
             "status": file.get("status", "modified"),
-            "review": report,
+            "review": _format_review_report(result),
+            "quality": result.overall_quality,
+            "summary": result.summary,
+            "strengths": result.strengths,
+            "areas_to_improve": result.areas_to_improve,
+            "findings": [
+                finding.model_dump(mode="json")
+                for finding in result.findings
+            ],
+            "additional_suggestions": result.additional_suggestions,
+            **counts,
         })
 
-    # Return a structured result so the webhook endpoint can report
-    # successful reviews and skipped files separately.
+    logger.info(
+        "Commit review processing finished: reviewed=%d skipped=%d",
+        len(reviews),
+        len(skipped_files),
+    )
+
     return {
         "reviewed_file_count": len(reviews),
         "skipped_file_count": len(skipped_files),

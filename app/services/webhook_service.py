@@ -1,6 +1,9 @@
+
 """Application service for processing verified GitHub webhooks."""
 
 import logging
+
+from sqlalchemy.orm import Session
 
 from app.models.github import (
     ChangedFileSummary,
@@ -9,6 +12,7 @@ from app.models.github import (
     SkippedFile,
     WebhookVerification,
 )
+from app.repositories import DuplicateDeliveryError, ReviewRepository
 from app.services.github_service import GitHubAPIError, GitHubClient
 from app.services.review_service import review_commit_files
 
@@ -25,22 +29,60 @@ class WebhookProcessingError(Exception):
 
 
 class WebhookService:
-    """Coordinate GitHub commit retrieval and AI code review."""
+    """Coordinate GitHub retrieval, AI review, and result persistence."""
+
+    def __init__(self, db: Session) -> None:
+        """Initialize the service with its request-scoped database session."""
+
+        self.review_repository = ReviewRepository(db)
+
+    @staticmethod
+    def _build_duplicate_response(
+        review_run,
+    ) -> GitHubWebhookResponse:
+        """Build an acknowledgement for an already persisted delivery."""
+
+        stored_reviews = [
+            FileReview(
+                path=item.file_name,
+                status=item.file_status,
+                review=item.review_report,
+                findings=item.findings,
+                issues_count=item.issues_count,
+                warnings_count=item.warnings_count,
+                suggestions_count=item.suggestions_count,
+                quality=item.overall_quality,
+                summary=item.summary,
+                strengths=item.strengths,
+                areas_to_improve=item.areas_to_improve,
+                additional_suggestions=item.additional_suggestions,
+            )
+            for item in review_run.file_reviews
+        ]
+
+        return GitHubWebhookResponse(
+            status="duplicate",
+            message="This GitHub delivery has already been processed.",
+            delivery_id=review_run.delivery_id,
+            repository=review_run.repository,
+            branch=review_run.branch,
+            commit=review_run.commit_sha,
+            reviewed_file_count=len(stored_reviews),
+            reviews=stored_reviews,
+        )
 
     async def process_webhook(
         self,
         verification: WebhookVerification,
     ) -> GitHubWebhookResponse:
-        """Process a verified webhook and return its structured response."""
+        """Process a verified webhook and persist its completed review."""
 
-        # A valid webhook may be ignored if it does not require a review.
         if verification.ignored_reason:
             logger.info(
                 "Ignoring GitHub webhook: delivery=%s reason=%s",
                 verification.delivery_id,
                 verification.ignored_reason,
             )
-
             return GitHubWebhookResponse(
                 status="ignored",
                 reason=verification.ignored_reason,
@@ -60,13 +102,33 @@ class WebhookService:
         branch = verification.branch
         commit_sha = verification.commit_sha
 
-        # These fields are guaranteed by the verification dependency.
-        # Keep a defensive check in case this service is called elsewhere.
         if not repository or not branch or not commit_sha:
             raise WebhookProcessingError(
                 500,
                 "Verified webhook is missing required commit information.",
             )
+
+        # Check idempotency before making external API or AI calls.
+        try:
+            existing_run = self.review_repository.get_by_delivery_id(
+                verification.delivery_id
+            )
+        except Exception as exc:
+            logger.exception(
+                "Could not check existing delivery %s",
+                verification.delivery_id,
+            )
+            raise WebhookProcessingError(
+                500,
+                "Could not check whether this GitHub delivery was processed.",
+            ) from exc
+
+        if existing_run is not None:
+            logger.info(
+                "Duplicate GitHub delivery received: %s",
+                verification.delivery_id,
+            )
+            return self._build_duplicate_response(existing_run)
 
         logger.info(
             "Processing push: delivery=%s repository=%s branch=%s commit=%s",
@@ -76,29 +138,24 @@ class WebhookService:
             commit_sha,
         )
 
-        # Retrieve commit details and changed-file contents from GitHub.
         try:
             async with GitHubClient() as github:
                 commit_data = await github.fetch_commit(
                     repository,
                     commit_sha,
                 )
-
         except ValueError as exc:
             logger.warning("Invalid GitHub retrieval input: %s", exc)
-
             raise WebhookProcessingError(
                 400,
                 "Invalid repository or commit information.",
             ) from exc
-
         except GitHubAPIError as exc:
             logger.exception(
                 "GitHub retrieval failed for %s at %s",
                 repository,
                 commit_sha,
             )
-
             raise WebhookProcessingError(
                 502,
                 (
@@ -107,7 +164,6 @@ class WebhookService:
                 ),
             ) from exc
 
-        # Prepare safe metadata about changed files for the API response.
         file_summaries = [
             ChangedFileSummary(
                 path=item["path"],
@@ -129,19 +185,14 @@ class WebhookService:
             len(file_summaries),
         )
 
-        # Delegate file filtering and AI review to the review service.
         try:
-            review_result = await review_commit_files(
-                commit_data["files"]
-            )
-
+            review_result = await review_commit_files(commit_data["files"])
         except Exception as exc:
             logger.exception(
                 "AI review failed for %s at %s",
                 repository,
                 commit_sha,
             )
-
             raise WebhookProcessingError(
                 502,
                 (
@@ -151,17 +202,56 @@ class WebhookService:
                 ),
             ) from exc
 
-        logger.info(
-            "AI review completed for %s: reviewed=%d skipped=%d",
-            repository,
-            review_result["reviewed_file_count"],
-            review_result["skipped_file_count"],
+        status = (
+            "completed_with_skips"
+            if review_result["skipped_file_count"] > 0
+            else "completed"
         )
 
-        # Return the final, typed API response.
+        try:
+            self.review_repository.save_review_run(
+                delivery_id=verification.delivery_id,
+                repository=commit_data["repository"],
+                branch=branch,
+                commit_sha=commit_data["commit"],
+                updated_by=verification.updated_by,
+                commit_author=commit_data.get("commit_author"),
+                status=status,
+                reviews=review_result["reviews"],
+            )
+        except DuplicateDeliveryError:
+            # Another request may have completed the same delivery
+            # between the initial lookup and the database insert.
+            existing_run = self.review_repository.get_by_delivery_id(
+                verification.delivery_id
+            )
+            if existing_run is not None:
+                return self._build_duplicate_response(existing_run)
+            raise WebhookProcessingError(
+                500,
+                "The review delivery conflicted with another database operation.",
+            )
+        except Exception as exc:
+            logger.exception(
+                "Could not persist review results for delivery %s",
+                verification.delivery_id,
+            )
+            raise WebhookProcessingError(
+                500,
+                "The review completed, but its results could not be saved.",
+            ) from exc
+
+        logger.info(
+            "Review persisted: delivery=%s reviewed=%d skipped=%d status=%s",
+            verification.delivery_id,
+            review_result["reviewed_file_count"],
+            review_result["skipped_file_count"],
+            status,
+        )
+
         return GitHubWebhookResponse(
             status="accepted",
-            message="GitHub commit retrieved and AI review completed.",
+            message="GitHub commit reviewed and results saved successfully.",
             delivery_id=verification.delivery_id,
             repository=commit_data["repository"],
             branch=branch,
@@ -171,10 +261,7 @@ class WebhookService:
             files=file_summaries,
             reviewed_file_count=review_result["reviewed_file_count"],
             skipped_file_count=review_result["skipped_file_count"],
-            reviews=[
-                FileReview(**item)
-                for item in review_result["reviews"]
-            ],
+            reviews=[FileReview(**item) for item in review_result["reviews"]],
             skipped_files=[
                 SkippedFile(**item)
                 for item in review_result["skipped_files"]
