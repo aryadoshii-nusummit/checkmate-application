@@ -1,4 +1,3 @@
-
 """
 Defines the shared SQLAlchemy declarative base for database models.
 
