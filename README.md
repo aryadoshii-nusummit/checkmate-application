@@ -1,193 +1,81 @@
-# ♟️ Checkmate — AI-Powered Code Review
+# ♟️ Checkmate — Refactoring Update
 
-**Automated code reviews powered by GitHub, FastAPI, and local AI.**
+> **Scope:** Implementation of manager feedback on Dependency Injection, service architecture, structured models, and database integration. This is a temporary update, not the final README.
 
-Checkmate is an automated code-review system that receives GitHub push events, retrieves changed files, and uses a locally hosted Ollama model to analyze code.
+## 1. What Needed Improvement?
 
-It identifies potential issues, highlights strengths, evaluates code quality, and provides actionable recommendations. Review results are stored in a SQLite database for persistence.
-
-## Features
-
-- **GitHub Integration:** Receives push webhooks and retrieves commit details and changed files.
-- **Webhook Security:** Validates HMAC-SHA256 signatures and configured branch restrictions.
-- **AI Code Review:** Uses Ollama with Qwen 2.5 Coder 3B for local code analysis.
-- **Structured Feedback:** Provides summaries, quality assessments, strengths, findings, and recommendations.
-- **File Handling:** Selects supported source files and skips files that cannot be reviewed.
-- **Database Persistence:** Stores review history and file-level results using SQLite and SQLAlchemy.
-- **Duplicate Detection:** Prevents repeated processing of previously handled webhook deliveries.
-- **Automated Tests:** Covers webhook verification, service processing, and database persistence.
-
-## Tech Stack
-
-| Technology | Purpose |
+| Previous Implementation | Improvement Required |
 |---|---|
-| Python | Application language |
-| FastAPI | API and webhook handling |
-| Pydantic | Data validation and models |
-| SQLAlchemy | Database ORM |
-| SQLite | Review history storage |
-| GitHub REST API | Commit and file retrieval |
-| HTTPX | HTTP communication |
-| Ollama | Local AI runtime |
-| Qwen 2.5 Coder 3B | Code-review model |
-| Pytest | Automated testing |
+| Services instantiated dependencies internally | Dependency Injection |
+| Webhook service handled tightly coupled operations | Separation of responsibilities |
+| Review logic directly coupled to Ollama | Dedicated ReviewService |
+| Unstructured dictionaries used across workflows | Typed models and Pydantic validation |
+| Database operations coupled to application logic | Repository pattern |
 
-## Project Structure
+## 2. Updated System Architecture
 
-```text
-checkmate_application/
-│
-├── app/
-│   ├── api/             # API endpoints
-│   ├── config/          # Application settings
-│   ├── constants/       # Review constants
-│   ├── database/        # SQLAlchemy models and sessions
-│   ├── dependencies/    # FastAPI dependencies
-│   ├── models/          # Pydantic models
-│   ├── repositories/    # Database operations
-│   ├── services/        # GitHub, AI and review services
-│   ├── utils/           # Reusable utilities
-│   └── main.py          # FastAPI application
-│
-├── scripts/             # Local testing scripts
-├── tests/               # Automated tests
-│
-├── .env.example
-├── requirements.txt
-└── README.md
+### Before
+
+```mermaid
+flowchart TD
+    A[GitHub Webhook] --> B[FastAPI Endpoint]
+    B --> C[WebhookService]
+    C --> D[GitHub Client]
+    C --> E[Ollama Client]
+    C --> F[Database Operations]
 ```
 
-## Prerequisites
+Services were more tightly coupled, with dependencies and responsibilities mixed within the workflow.
 
-- Python 3.14 or a compatible supported version
-- Git
-- Ollama installed and running
-- GitHub repository access
+### After — Dependency Injection & Separation of Responsibilities
 
-Pull the configured AI model:
+```mermaid
+flowchart TD
+    A[GitHub Webhook] --> B[FastAPI Endpoint]
+    B --> C[Verification Dependencies]
+    C --> D[WebhookService]
 
-```powershell
-ollama pull qwen2.5-coder:3b
+    DI[Dependency Providers] -. inject .-> D
+
+    D --> E[GitHubClientFactory]
+    D --> F[ReviewService]
+    D --> G[ReviewRepository]
+
+    F --> H[OllamaClient]
+    G --> I[(SQLite Database)]
+
+    E --> J[GitHub REST API]
+    H --> K[Local Ollama Model]
 ```
 
-## Setup
+**Key change:** Dependencies are now injected into services instead of being instantiated within business logic. The `WebhookService` orchestrates the workflow, while GitHub communication, AI review, and persistence are handled by dedicated components.
 
-Clone the repository and switch to the development branch:
+## 3. What Was Implemented?
 
-```powershell
-git clone https://github.com/aryadoshii-nusummit/checkmate-application.git
+| Component | Implementation |
+|---|---|
+| **Dependency Injection** | Centralized providers in `app/dependencies/services.py` |
+| **WebhookService** | Injects `ReviewRepository`, `GitHubClientFactory`, and `ReviewService` |
+| **ReviewService** | Dedicated review-processing service with injected `OllamaClient` |
+| **Pydantic Models** | Structured and validated webhook, response, and review models |
+| **Type Safety** | Typed internal workflow data and restricted status/severity values |
+| **Repository Pattern** | Isolated database operations, persistence, and transaction handling |
 
-cd checkmate-application
+## 4. Verification
 
-git checkout refactor/dependency-injection-and-api-models
-```
+| Check | Result |
+|---|---|
+| Compilation | Passed |
+| Automated tests | **18/18 passed** |
+| Database persistence tests | Passed |
+| Duplicate webhook handling | Passed |
+| Transaction rollback | Passed |
+| `git diff --check` | Passed |
 
-Create and activate a virtual environment:
+## Outcome
 
-```powershell
-py -m venv .venv
+The refactoring addresses the manager's feedback by introducing a cleaner dependency-injected architecture, separating service responsibilities, enforcing structured data models, and isolating database operations.
 
-.\.venv\Scripts\Activate.ps1
-```
+**Implementation complete and verified.**
 
-Install dependencies:
-
-```powershell
-python -m pip install --upgrade pip
-
-pip install -r requirements.txt
-```
-
-Create the local environment file:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Configure the required values in `.env`, including:
-
-- `GITHUB_WEBHOOK_SECRET`
-- `CHECKMATE_ALLOWED_BRANCHES`
-- `OLLAMA_BASE_URL`
-- `OLLAMA_MODEL`
-- `OLLAMA_TIMEOUT_SECONDS`
-
-Use `.env.example` as the reference for the complete configuration. Never commit secrets or credentials.
-
-## Run the Application
-
-Make sure Ollama is running, then start FastAPI:
-
-```powershell
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-**Available endpoints:**
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/health` | Health check |
-| POST | `/webhooks/github` | GitHub webhook receiver |
-
-Interactive API documentation:
-
-http://127.0.0.1:8000/docs
-
-## Testing
-
-Run the automated test suite:
-
-```powershell
-python -m pytest tests/ -v
-```
-
-**Latest verified result: 18 tests passed.**
-
-To test the complete local webhook workflow, keep the application running and execute:
-
-```powershell
-python scripts/send_github_commit_webhook.py
-```
-
-## Database
-
-Checkmate uses SQLite with SQLAlchemy ORM.
-
-The database is automatically initialized when the application starts and is stored locally as:
-
-```text
-checkmate.db
-```
-
-It contains two primary tables:
-
-- `review_runs` — stores commit and review-run information.
-- `file_reviews` — stores individual file reviews and structured AI feedback.
-
-The database can be inspected using [DB Browser for SQLite](https://sqlitebrowser.org/).
-
-## Current Status
-
-The development branch includes:
-
-- GitHub webhook integration and verification.
-- Dependency-injected application services.
-- Structured AI code reviews using local Ollama.
-- SQLite persistence for review history.
-- Duplicate webhook detection.
-- Automated tests covering core workflows.
-
-**Branch:** `refactor/dependency-injection-and-api-models`
-
-**Latest commit:** `c774a16` — `feat: add database persistence for code reviews`
-
-## Future Improvements
-
-- Review history retrieval APIs.
-- Improved AI review accuracy and recommendation quality.
-- Database migrations using Alembic.
-- Enhanced logging and production-readiness improvements.
-
----
-
-*Checkmate aims to make code reviews more consistent and actionable—helping developers identify problems, recognize good practices, and continuously improve code quality.*
+*Temporary refactoring documentation — to be replaced by the final README.*

@@ -6,6 +6,8 @@ from urllib.parse import quote
 
 import httpx
 
+from app.models.github import GitHubChangedFile
+
 from app.config.settings import GITHUB_API_URL, GITHUB_TOKEN
 
 
@@ -99,7 +101,7 @@ class GitHubClient:
                 "GitHub commit response did not contain a SHA."
             )
 
-        files: list[dict] = []
+        files: list[GitHubChangedFile] = []
 
         # Process each file changed in the commit.
         for item in commit.get("files", []):

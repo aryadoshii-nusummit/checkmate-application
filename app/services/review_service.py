@@ -1,12 +1,16 @@
-
 """Coordinate structured AI code reviews for changed GitHub files."""
 
 import logging
 import os
-from typing import Any
 
 from app.config.settings import LINE_LIMIT
 from app.constants.review import REVIEWABLE_EXTENSIONS
+from app.models.github import (
+    GitHubChangedFile,
+    ReviewFileResult,
+    ReviewServiceResult,
+    SkippedFileResult,
+)
 from app.models.review import ReviewResult
 from app.services.ollama_service import OllamaClient
 
@@ -85,93 +89,101 @@ def _count_findings(result: ReviewResult) -> dict[str, int]:
     }
 
 
-async def review_commit_files(
-    files: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """
-    Review eligible files from a GitHub commit using Ollama.
+class ReviewService:
+    """Coordinate code reviews using an injected Ollama client."""
 
-    Each eligible file receives a validated structured review. Files that
-    cannot be reviewed are reported explicitly rather than silently ignored.
-    """
+    def __init__(self, ollama_client: OllamaClient) -> None:
+        """Initialize the review service with its AI client."""
+        self.ollama_client = ollama_client
 
-    client = OllamaClient()
-    reviews: list[dict[str, Any]] = []
-    skipped_files: list[dict[str, Any]] = []
+    async def review_commit_files(
+        self,
+        files: list[GitHubChangedFile],
+    ) -> ReviewServiceResult:
+        """
+        Review eligible files from a GitHub commit using Ollama.
 
-    for file in files:
-        path = file.get("path", "")
-        content = file.get("content")
-        extension = os.path.splitext(path)[1].lower()
+        Each eligible file receives a validated structured review. Files that
+        cannot be reviewed are reported explicitly rather than silently ignored.
+        """
 
-        if extension not in REVIEWABLE_EXTENSIONS:
-            skipped_files.append({
+        client = self.ollama_client
+        reviews: list[ReviewFileResult] = []
+        skipped_files: list[SkippedFileResult] = []
+
+        for file in files:
+            path = file.get("path", "")
+            content = file.get("content")
+            extension = os.path.splitext(path)[1].lower()
+
+            if extension not in REVIEWABLE_EXTENSIONS:
+                skipped_files.append({
+                    "path": path,
+                    "reason": "unsupported_file_type",
+                })
+                continue
+
+            if not isinstance(content, str) or not content.strip():
+                skipped_files.append({
+                    "path": path,
+                    "reason": "content_unavailable",
+                })
+                continue
+
+            if "\x00" in content:
+                skipped_files.append({
+                    "path": path,
+                    "reason": "binary_file",
+                })
+                continue
+
+            lines = content.splitlines()
+
+            if len(lines) > LINE_LIMIT:
+                skipped_files.append({
+                    "path": path,
+                    "reason": "file_exceeds_line_limit",
+                    "line_count": len(lines),
+                    "line_limit": LINE_LIMIT,
+                })
+                continue
+
+            try:
+                result = await client.review_code(
+                    file_path=path,
+                    code=content,
+                )
+            except Exception:
+                logger.exception("AI review failed for file %s", path)
+                raise
+
+            counts = _count_findings(result)
+
+            reviews.append({
                 "path": path,
-                "reason": "unsupported_file_type",
+                "status": file.get("status", "modified"),
+                "review": _format_review_report(result),
+                "quality": result.overall_quality,
+                "summary": result.summary,
+                "strengths": result.strengths,
+                "areas_to_improve": result.areas_to_improve,
+                "findings": [
+                    finding.model_dump(mode="json")
+                    for finding in result.findings
+                ],
+                "additional_suggestions": result.additional_suggestions,
+                **counts,
             })
-            continue
 
-        if not isinstance(content, str) or not content.strip():
-            skipped_files.append({
-                "path": path,
-                "reason": "content_unavailable",
-            })
-            continue
+        logger.info(
+            "Commit review processing finished: reviewed=%d skipped=%d",
+            len(reviews),
+            len(skipped_files),
+        )
 
-        if "\x00" in content:
-            skipped_files.append({
-                "path": path,
-                "reason": "binary_file",
-            })
-            continue
-
-        lines = content.splitlines()
-
-        if len(lines) > LINE_LIMIT:
-            skipped_files.append({
-                "path": path,
-                "reason": "file_exceeds_line_limit",
-                "line_count": len(lines),
-                "line_limit": LINE_LIMIT,
-            })
-            continue
-
-        try:
-            result = await client.review_code(
-                file_path=path,
-                code=content,
-            )
-        except Exception:
-            logger.exception("AI review failed for file %s", path)
-            raise
-
-        counts = _count_findings(result)
-
-        reviews.append({
-            "path": path,
-            "status": file.get("status", "modified"),
-            "review": _format_review_report(result),
-            "quality": result.overall_quality,
-            "summary": result.summary,
-            "strengths": result.strengths,
-            "areas_to_improve": result.areas_to_improve,
-            "findings": [
-                finding.model_dump(mode="json")
-                for finding in result.findings
-            ],
-            "additional_suggestions": result.additional_suggestions,
-            **counts,
-        })
-
-    logger.info(
-        "Commit review processing finished: reviewed=%d skipped=%d",
-        len(reviews),
-        len(skipped_files),
-    )
-
-    return {
-        "reviewed_file_count": len(reviews),
-        "skipped_file_count": len(skipped_files),
-        "reviews": reviews,
-        "skipped_files": skipped_files,
-    }
+        return {
+            "reviewed_file_count": len(reviews),
+            "skipped_file_count": len(skipped_files),
+            "reviews": reviews,
+            "skipped_files": skipped_files,
+        }

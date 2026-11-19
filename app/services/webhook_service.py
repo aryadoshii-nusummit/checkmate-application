@@ -2,21 +2,25 @@
 """Application service for processing verified GitHub webhooks."""
 
 import logging
+from typing import Callable
 
-from sqlalchemy.orm import Session
 
+from app.database.models import ReviewRun
 from app.models.github import (
     ChangedFileSummary,
     FileReview,
     GitHubWebhookResponse,
+    ReviewRunStatus,
     SkippedFile,
     WebhookVerification,
 )
 from app.repositories import DuplicateDeliveryError, ReviewRepository
 from app.services.github_service import GitHubAPIError, GitHubClient
-from app.services.review_service import review_commit_files
+from app.services.review_service import ReviewService
 
 logger = logging.getLogger(__name__)
+
+GitHubClientFactory = Callable[[], GitHubClient]
 
 
 class WebhookProcessingError(Exception):
@@ -31,14 +35,21 @@ class WebhookProcessingError(Exception):
 class WebhookService:
     """Coordinate GitHub retrieval, AI review, and result persistence."""
 
-    def __init__(self, db: Session) -> None:
-        """Initialize the service with its request-scoped database session."""
+    def __init__(
+        self,
+        review_repository: ReviewRepository,
+        github_client_factory: GitHubClientFactory,
+        review_service: ReviewService,
+    ) -> None:
+        """Initialize the service with its injected dependencies."""
 
-        self.review_repository = ReviewRepository(db)
+        self.review_repository = review_repository
+        self.github_client_factory = github_client_factory
+        self.review_service = review_service
 
     @staticmethod
     def _build_duplicate_response(
-        review_run,
+        review_run: ReviewRun,
     ) -> GitHubWebhookResponse:
         """Build an acknowledgement for an already persisted delivery."""
 
@@ -139,7 +150,7 @@ class WebhookService:
         )
 
         try:
-            async with GitHubClient() as github:
+            async with self.github_client_factory() as github:
                 commit_data = await github.fetch_commit(
                     repository,
                     commit_sha,
@@ -186,7 +197,9 @@ class WebhookService:
         )
 
         try:
-            review_result = await review_commit_files(commit_data["files"])
+            review_result = await self.review_service.review_commit_files(
+                commit_data["files"]
+            )
         except Exception as exc:
             logger.exception(
                 "AI review failed for %s at %s",
@@ -202,7 +215,7 @@ class WebhookService:
                 ),
             ) from exc
 
-        status = (
+        status: ReviewRunStatus = (
             "completed_with_skips"
             if review_result["skipped_file_count"] > 0
             else "completed"

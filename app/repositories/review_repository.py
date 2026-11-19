@@ -2,13 +2,13 @@
 """Persistence operations for completed Checkmate code reviews."""
 
 import logging
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database.models import FileReview, ReviewRun
+from app.models.github import ReviewFileResult, ReviewRunStatus
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,8 @@ class ReviewRepository:
         commit_sha: str,
         updated_by: str | None,
         commit_author: str | None,
-        status: str,
-        reviews: list[dict[str, Any]],
+        status: ReviewRunStatus,
+        reviews: list[ReviewFileResult],
     ) -> ReviewRun:
         """
         Persist a review run and all its file reviews atomically.

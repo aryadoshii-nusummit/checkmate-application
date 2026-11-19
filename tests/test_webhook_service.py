@@ -11,6 +11,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.models.github import WebhookVerification
+from app.repositories import ReviewRepository
+from app.services.ollama_service import OllamaClient
+from app.services.review_service import ReviewService
+import app.services.webhook_service as webhook_service_module
 from app.services.webhook_service import (
     WebhookProcessingError,
     WebhookService,
@@ -71,18 +75,27 @@ def make_github_context(commit_response):
     return github_context, github_client
 
 
+def make_webhook_service(db_session):
+    """Build the webhook service with injected test dependencies."""
+    return WebhookService(
+        review_repository=ReviewRepository(db_session),
+        github_client_factory=webhook_service_module.GitHubClient,
+        review_service=ReviewService(OllamaClient()),
+    )
+
+
 def test_ignored_webhook_returns_ignored_response(db_session):
     """Ignored webhook events should return without external processing."""
     verification = make_verification(
-        ignored_reason="Branch is not configured"
+        ignored_reason="branch_not_configured"
     )
 
     response = run_async(
-        WebhookService(db_session).process_webhook(verification)
+        make_webhook_service(db_session).process_webhook(verification)
     )
 
     assert response.status == "ignored"
-    assert response.reason == "Branch is not configured"
+    assert response.reason == "branch_not_configured"
     assert response.delivery_id == "test-delivery-001"
 
 
@@ -92,7 +105,7 @@ def test_missing_verified_commit_information_returns_server_error(db_session):
 
     with pytest.raises(WebhookProcessingError) as exc_info:
         run_async(
-            WebhookService(db_session).process_webhook(verification)
+            make_webhook_service(db_session).process_webhook(verification)
         )
 
     assert exc_info.value.status_code == 500
@@ -121,13 +134,13 @@ def test_successful_webhook_processing(db_session):
             return_value=github_context,
         ),
         patch(
-            "app.services.webhook_service.review_commit_files",
+            "app.services.review_service.ReviewService.review_commit_files",
             new_callable=AsyncMock,
             return_value=review_result,
         ) as review_mock,
     ):
         response = run_async(
-            WebhookService(db_session).process_webhook(verification)
+            make_webhook_service(db_session).process_webhook(verification)
         )
 
     github_client.fetch_commit.assert_awaited_once_with(
@@ -161,14 +174,14 @@ def test_review_failure_returns_bad_gateway(db_session):
             return_value=github_context,
         ),
         patch(
-            "app.services.webhook_service.review_commit_files",
+            "app.services.review_service.ReviewService.review_commit_files",
             new_callable=AsyncMock,
             side_effect=RuntimeError("Simulated review failure"),
         ),
     ):
         with pytest.raises(WebhookProcessingError) as exc_info:
             run_async(
-                WebhookService(db_session).process_webhook(verification)
+                make_webhook_service(db_session).process_webhook(verification)
             )
 
     assert exc_info.value.status_code == 502
@@ -221,14 +234,19 @@ def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session
         "reviews": [
             {
                 "path": "app/example.py",
-                "status": "reviewed",
+                "status": "modified",
                 "review": "## Review\\n\\nOne issue identified.",
-                "findings": [
-                    {
-                        "title": "Example issue",
-                        "severity": "HIGH",
-                        "category": "security",
-                    }
+                "findings": [{
+                            "title": "Example issue",
+                            "severity": "HIGH",
+                            "confidence": "HIGH",
+                            "category": "security",
+                            "line_numbers": [10],
+                            "evidence": "Example vulnerable code",
+                            "problem": "The code contains a security issue.",
+                            "impact": "The issue could affect application security.",
+                            "recommendation": "Correct the vulnerable implementation.",
+                        }
                 ],
                 "issues_count": 1,
                 "warnings_count": 0,
@@ -245,13 +263,13 @@ def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session
             return_value=github_context,
         ),
         patch(
-            "app.services.webhook_service.review_commit_files",
+            "app.services.review_service.ReviewService.review_commit_files",
             new_callable=AsyncMock,
             return_value=review_result,
         ) as first_review_mock,
     ):
         first_response = run_async(
-            WebhookService(db_session).process_webhook(verification)
+            make_webhook_service(db_session).process_webhook(verification)
         )
 
     assert first_response.status == "accepted"
@@ -267,12 +285,12 @@ def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session
             "app.services.webhook_service.GitHubClient"
         ) as github_mock,
         patch(
-            "app.services.webhook_service.review_commit_files",
+            "app.services.review_service.ReviewService.review_commit_files",
             new_callable=AsyncMock,
         ) as review_mock,
     ):
         duplicate_response = run_async(
-            WebhookService(db_session).process_webhook(verification)
+            make_webhook_service(db_session).process_webhook(verification)
         )
 
     assert duplicate_response.status == "duplicate"

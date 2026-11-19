@@ -11,14 +11,14 @@ Quality = Literal["GOOD", "ACCEPTABLE", "NEEDS IMPROVEMENT"]
 
 
 class ReviewFinding(BaseModel):
-    """A distinct, evidence-backed issue identified in a source file."""
+    """Represent a distinct, evidence-backed issue in a source file."""
 
     model_config = ConfigDict(extra="ignore")
 
-    title: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=300)
     severity: Severity
     confidence: Confidence
-    category: str = Field(min_length=1)
+    category: str = Field(min_length=1, max_length=100)
     line_numbers: list[int] = Field(min_length=1)
     evidence: str = Field(min_length=1)
     problem: str = Field(min_length=1)
@@ -29,6 +29,7 @@ class ReviewFinding(BaseModel):
     @classmethod
     def validate_line_numbers(cls, values: list[int]) -> list[int]:
         """Require unique, positive source line numbers."""
+
         if any(number < 1 for number in values):
             raise ValueError("Line numbers must be positive integers.")
 
@@ -39,7 +40,7 @@ class ReviewFinding(BaseModel):
 
 
 class ReviewResult(BaseModel):
-    """Complete structured result returned by the AI reviewer."""
+    """Represent the complete structured result returned by the AI reviewer."""
 
     model_config = ConfigDict(extra="ignore")
 
