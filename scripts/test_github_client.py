@@ -3,8 +3,8 @@
 import asyncio
 import os
 
-from app.config import GITHUB_API_URL, GITHUB_TOKEN  # load project config/.env
-from app.integrations.github_client import GitHubClient
+from app.config.settings import GITHUB_API_URL, GITHUB_TOKEN  # load project config/.env
+from app.services.github_service import GitHubClient
 
 
 async def main() -> None:
@@ -42,3 +42,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
