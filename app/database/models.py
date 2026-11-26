@@ -19,6 +19,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -204,18 +205,21 @@ class FileReview(Base):
     strengths: Mapped[list[str]] = mapped_column(
         JSON,
         default=list,
+        server_default=text("'[]'"),
         nullable=False,
     )
 
     areas_to_improve: Mapped[list[str]] = mapped_column(
         JSON,
         default=list,
+        server_default=text("'[]'"),
         nullable=False,
     )
 
     additional_suggestions: Mapped[list[str]] = mapped_column(
         JSON,
         default=list,
+        server_default=text("'[]'"),
         nullable=False,
     )
 

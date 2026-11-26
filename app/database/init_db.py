@@ -1,30 +1,26 @@
-"""
-Initializes the database schema asynchronously.
 
-All registered SQLAlchemy models are created during application startup.
+"""
+Database initialization compatibility module.
+
+Database schema creation and updates are managed through Alembic.
+
+Run the following command before starting the application:
+
+    python -m alembic upgrade head
 """
 
 import logging
-
-from app.database.base import Base
-from app.database.models import FileReview, ReviewRun
-from app.database.session import engine
-
 
 logger = logging.getLogger(__name__)
 
 
 async def initialize_database() -> None:
     """
-    Create registered database tables if they do not already exist.
+    Confirm that database schema management is handled by Alembic.
 
-    run_sync bridges SQLAlchemy's synchronous metadata operation into
-    the asynchronous engine connection.
+    This function intentionally does not create or modify database tables.
     """
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
     logger.info(
-        "Database initialized successfully. Registered tables: %s",
-        list(Base.metadata.tables.keys()),
+        "Database schema management is handled by Alembic. "
+        "Run 'python -m alembic upgrade head' before application startup."
     )
