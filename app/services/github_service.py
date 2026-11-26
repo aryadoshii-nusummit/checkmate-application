@@ -1,0 +1,194 @@
+"""GitHub REST API client for fetching committed code."""
+
+import base64
+from typing import cast
+from urllib.parse import quote
+
+import httpx
+
+from app.config.settings import GITHUB_API_URL, GITHUB_TOKEN
+from app.models.github import FileStatus, GitHubChangedFile
+
+
+class GitHubAPIError(Exception):
+    """Raised when a GitHub API operation fails."""
+
+
+class GitHubClient:
+    def __init__(self) -> None:
+        # Set the headers required for GitHub REST API requests.
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "Checkmate-Code-Review",
+        }
+
+        # Add authentication when a GitHub token is configured.
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+        # Create an asynchronous HTTP client.
+        # follow_redirects=True handles GitHub repository rename redirects.
+        self.client = httpx.AsyncClient(
+            base_url=GITHUB_API_URL,
+            headers=headers,
+            timeout=30.0,
+            follow_redirects=True,
+        )
+
+    async def __aenter__(self) -> "GitHubClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.client.aclose()
+
+    async def _get_json(
+        self,
+        path: str,
+        params: dict | None = None,
+    ) -> dict:
+        """Send a GET request and return the JSON response."""
+        try:
+            response = await self.client.get(path, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if not isinstance(data, dict):
+                raise GitHubAPIError(
+                    "GitHub returned an unexpected JSON response."
+                )
+
+            return data
+
+        except httpx.HTTPError as exc:
+            raise GitHubAPIError(
+                f"GitHub API request failed: {exc}"
+            ) from exc
+
+        except ValueError as exc:
+            raise GitHubAPIError(
+                "GitHub returned invalid JSON."
+            ) from exc
+
+    async def fetch_commit(
+        self,
+        repository: str,
+        commit_sha: str,
+    ) -> dict:
+        """Fetch commit metadata and changed-file contents.
+
+        Webhook-driven reviews pass the exact commit SHA.
+        """
+        parts = repository.split("/")
+
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                "Repository must have the format owner/repository."
+            )
+
+        if not isinstance(commit_sha, str) or not commit_sha.strip():
+            raise ValueError("A commit SHA or ref is required.")
+
+        owner, repo = parts
+
+        # Fetch commit metadata and changed-file information.
+        commit_path = (
+            f"/repos/{owner}/{repo}/commits/"
+            f"{quote(commit_sha, safe='')}"
+        )
+
+        commit = await self._get_json(commit_path)
+
+        resolved_sha = commit.get("sha")
+
+        if not isinstance(resolved_sha, str) or not resolved_sha:
+            raise GitHubAPIError(
+                "GitHub commit response did not contain a SHA."
+            )
+
+        files: list[GitHubChangedFile] = []
+
+        # Process each file changed in the commit.
+        for item in commit.get("files", []):
+            path = item.get("filename")
+            raw_status = item.get("status", "unknown")
+
+            if not isinstance(path, str) or not path:
+                continue
+
+            # Validate the status received from the external GitHub API.
+            allowed_statuses = {
+                "added",
+                "removed",
+                "modified",
+                "renamed",
+                "copied",
+                "unknown",
+            }
+
+        if isinstance(raw_status, str) and raw_status in allowed_statuses:
+            status = cast(FileStatus, raw_status)
+        else:
+            status = "unknown"
+
+            result: GitHubChangedFile = {
+                "path": path,
+                "status": status,
+                "additions": item.get("additions", 0),
+                "deletions": item.get("deletions", 0),
+                "changes": item.get("changes", 0),
+                "patch": item.get("patch"),
+                "content": None,
+            }
+
+            # Deleted files have no current content at the target commit.
+            if status != "removed":
+                encoded_path = quote(path, safe="/")
+
+                content_path = (
+                    f"/repos/{owner}/{repo}/contents/{encoded_path}"
+                )
+
+                try:
+                    # Fetch contents at the exact commit SHA.
+                    content_data = await self._get_json(
+                        content_path,
+                        params={"ref": resolved_sha},
+                    )
+
+                    # GitHub returns file contents as Base64-encoded data.
+                    if (
+                        content_data.get("type") == "file"
+                        and content_data.get("encoding") == "base64"
+                    ):
+                        raw_content = base64.b64decode(
+                            content_data["content"]
+                        )
+
+                        result["content"] = raw_content.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+
+                except GitHubAPIError:
+                    # Continue review using the patch when content
+                    # is unavailable through the Contents API.
+                    result["content"] = None
+
+            files.append(result)
+
+        # Preserve the commit author's name for database persistence.
+        commit_author = (
+            commit.get("commit", {})
+            .get("author", {})
+            .get("name")
+        )
+
+        return {
+            "repository": repository,
+            "commit": resolved_sha,
+            "message": commit.get("commit", {}).get("message", ""),
+            "commit_author": commit_author,
+            "files": files,
+        }
