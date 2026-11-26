@@ -1,9 +1,4 @@
-"""
-Application entry point for the Checkmate code review system.
-
-Initializes application resources during startup and registers
-the API routers used by the application.
-"""
+"""Application entry point and lifecycle management for Checkmate."""
 
 import logging
 from contextlib import asynccontextmanager
@@ -14,29 +9,28 @@ from app.api.health import router as health_router
 from app.api.github_webhook import router as github_webhook_router
 from app.config.settings import APP_NAME
 from app.database.init_db import initialize_database
+from app.database.session import engine
 
 
 logger = logging.getLogger(__name__)
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Manage application startup and shutdown operations.
-
-    Database tables are initialized before the application starts
-    accepting requests.
-    """
-
+    """Manage database initialization and cleanup during application lifecycle."""
     logger.info("Starting Checkmate application...")
 
-    initialize_database()
+    try:
+        await initialize_database()
+        logger.info("Checkmate database is ready.")
 
-    logger.info("Checkmate database is ready.")
+        yield
 
-    yield
-
-    logger.info("Shutting down Checkmate application...")
+    finally:
+        logger.info("Shutting down Checkmate application...")
+        await engine.dispose()
+        logger.info("Database engine connections disposed.")
 
 
 # Initialize the FastAPI application and its lifecycle management.

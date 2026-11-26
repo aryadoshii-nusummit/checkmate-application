@@ -1,10 +1,14 @@
 ﻿"""Tests for Checkmate review-result persistence."""
 
 import pytest
-from sqlalchemy import create_engine, func, select
+
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.ext.asyncio import (
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.database.base import Base
 from app.database.models import FileReview, ReviewRun
@@ -15,28 +19,34 @@ from app.repositories.review_repository import (
 
 
 @pytest.fixture
-def db_session():
-    """Provide an isolated in-memory database for each repository test."""
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture
+async def db_session():
+    """Provide an isolated asynchronous in-memory database."""
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(bind=engine)
-
-    testing_session = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    session = testing_session()
 
     try:
-        yield session
-    finally:
-        session.close()
-        engine.dispose()
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
 
+        testing_session = async_sessionmaker(
+            bind=engine,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+
+        async with testing_session() as session:
+            yield session
+
+    finally:
+        await engine.dispose()
 
 def sample_review():
     """Return a representative structured file-review result."""
@@ -63,7 +73,7 @@ def sample_review():
     }
 
 
-def save_sample_run(repository, **overrides):
+async def save_sample_run(repository, **overrides):
     """Save a representative review run, allowing individual fields to vary."""
     values = {
         "delivery_id": "delivery-001",
@@ -76,16 +86,16 @@ def save_sample_run(repository, **overrides):
         "reviews": [sample_review()],
     }
     values.update(overrides)
-    return repository.save_review_run(**values)
+    return await repository.save_review_run(**values)
 
 
-def test_saves_review_run_and_file_reviews(db_session):
+@pytest.mark.anyio
+async def test_saves_review_run_and_file_reviews(db_session):
     repository = ReviewRepository(db_session)
 
-    run = save_sample_run(repository)
+    run = await save_sample_run(repository)
 
-    db_session.expire_all()
-    saved_run = repository.get_by_delivery_id("delivery-001")
+    saved_run = await repository.get_by_delivery_id("delivery-001")
 
     assert saved_run is not None
     assert saved_run.id == run.id
@@ -113,28 +123,30 @@ def test_saves_review_run_and_file_reviews(db_session):
     assert "Found security and validation concerns." in file_review.review_report
 
 
-def test_rejects_duplicate_delivery_id(db_session):
+@pytest.mark.anyio
+async def test_rejects_duplicate_delivery_id(db_session):
     repository = ReviewRepository(db_session)
 
-    save_sample_run(repository)
+    await save_sample_run(repository)
 
     with pytest.raises(DuplicateDeliveryError):
-        save_sample_run(repository)
+        await save_sample_run(repository)
 
 
-def test_rolls_back_run_when_file_review_insert_fails(db_session):
+@pytest.mark.anyio
+async def test_rolls_back_run_when_file_review_insert_fails(db_session):
     repository = ReviewRepository(db_session)
 
     invalid_review = sample_review()
     invalid_review["review"] = None
 
     with pytest.raises(IntegrityError):
-        save_sample_run(repository, reviews=[invalid_review])
+        await save_sample_run(repository, reviews=[invalid_review])
 
-    run_count = db_session.scalar(
+    run_count = await db_session.scalar(
         select(func.count()).select_from(ReviewRun)
     )
-    file_review_count = db_session.scalar(
+    file_review_count = await db_session.scalar(
         select(func.count()).select_from(FileReview)
     )
 
@@ -142,17 +154,18 @@ def test_rolls_back_run_when_file_review_insert_fails(db_session):
     assert file_review_count == 0
 
 
-def test_saves_run_without_file_reviews(db_session):
+@pytest.mark.anyio
+async def test_saves_run_without_file_reviews(db_session):
     repository = ReviewRepository(db_session)
 
-    run = save_sample_run(
+    run = await save_sample_run(
         repository,
         delivery_id="delivery-empty",
         status="completed_with_skips",
         reviews=[],
     )
 
-    saved_run = repository.get_by_delivery_id("delivery-empty")
+    saved_run = await repository.get_by_delivery_id("delivery-empty")
 
     assert saved_run is not None
     assert saved_run.id == run.id
@@ -163,17 +176,18 @@ def test_saves_run_without_file_reviews(db_session):
     assert saved_run.file_reviews == []
 
 
-def test_preserves_optional_author_fields(db_session):
+@pytest.mark.anyio
+async def test_preserves_optional_author_fields(db_session):
     repository = ReviewRepository(db_session)
 
-    run = save_sample_run(
+    run = await save_sample_run(
         repository,
         delivery_id="delivery-no-authors",
         updated_by=None,
         commit_author=None,
     )
 
-    saved_run = repository.get_by_delivery_id("delivery-no-authors")
+    saved_run = await repository.get_by_delivery_id("delivery-no-authors")
 
     assert saved_run is not None
     assert saved_run.id == run.id
@@ -181,7 +195,8 @@ def test_preserves_optional_author_fields(db_session):
     assert saved_run.commit_author is None
 
 
-def test_saves_all_structured_review_fields(db_session):
+@pytest.mark.anyio
+async def test_saves_all_structured_review_fields(db_session):
     """Persist and retrieve all structured AI review metadata."""
     repository = ReviewRepository(db_session)
 
@@ -196,13 +211,12 @@ def test_saves_all_structured_review_fields(db_session):
         }
     )
 
-    saved_run = save_sample_run(
+    saved_run = await save_sample_run(
         repository,
         reviews=[review],
     )
 
-    db_session.expire_all()
-    retrieved_run = repository.get_by_delivery_id(saved_run.delivery_id)
+    retrieved_run = await repository.get_by_delivery_id(saved_run.delivery_id)
 
     assert retrieved_run is not None
     assert len(retrieved_run.file_reviews) == 1

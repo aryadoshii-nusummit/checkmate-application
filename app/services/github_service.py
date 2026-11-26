@@ -1,14 +1,13 @@
-
 """GitHub REST API client for fetching committed code."""
 
 import base64
+from typing import cast
 from urllib.parse import quote
 
 import httpx
 
-from app.models.github import GitHubChangedFile
-
 from app.config.settings import GITHUB_API_URL, GITHUB_TOKEN
+from app.models.github import FileStatus, GitHubChangedFile
 
 
 class GitHubAPIError(Exception):
@@ -43,7 +42,11 @@ class GitHubClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.client.aclose()
 
-    async def _get_json(self, path: str, params: dict | None = None) -> dict:
+    async def _get_json(
+        self,
+        path: str,
+        params: dict | None = None,
+    ) -> dict:
         """Send a GET request and return the JSON response."""
         try:
             response = await self.client.get(path, params=params)
@@ -68,11 +71,14 @@ class GitHubClient:
                 "GitHub returned invalid JSON."
             ) from exc
 
-    async def fetch_commit(self, repository: str, commit_sha: str) -> dict:
-        """Fetch a commit's metadata and changed-file contents.
+    async def fetch_commit(
+        self,
+        repository: str,
+        commit_sha: str,
+    ) -> dict:
+        """Fetch commit metadata and changed-file contents.
 
-        `commit_sha` should be a commit SHA. A branch ref can be used for the
-        standalone smoke test, but webhook-driven reviews pass the exact SHA.
+        Webhook-driven reviews pass the exact commit SHA.
         """
         parts = repository.split("/")
 
@@ -86,7 +92,7 @@ class GitHubClient:
 
         owner, repo = parts
 
-        # Fetch commit metadata and information about changed files.
+        # Fetch commit metadata and changed-file information.
         commit_path = (
             f"/repos/{owner}/{repo}/commits/"
             f"{quote(commit_sha, safe='')}"
@@ -106,12 +112,27 @@ class GitHubClient:
         # Process each file changed in the commit.
         for item in commit.get("files", []):
             path = item.get("filename")
-            status = item.get("status", "unknown")
+            raw_status = item.get("status", "unknown")
 
             if not isinstance(path, str) or not path:
                 continue
 
-            result = {
+            # Validate the status received from the external GitHub API.
+            allowed_statuses = {
+                "added",
+                "removed",
+                "modified",
+                "renamed",
+                "copied",
+                "unknown",
+            }
+
+        if isinstance(raw_status, str) and raw_status in allowed_statuses:
+            status = cast(FileStatus, raw_status)
+        else:
+            status = "unknown"
+
+            result: GitHubChangedFile = {
                 "path": path,
                 "status": status,
                 "additions": item.get("additions", 0),
@@ -130,7 +151,7 @@ class GitHubClient:
                 )
 
                 try:
-                    # Fetch the file contents at the exact commit SHA.
+                    # Fetch contents at the exact commit SHA.
                     content_data = await self._get_json(
                         content_path,
                         params={"ref": resolved_sha},
@@ -151,13 +172,13 @@ class GitHubClient:
                         )
 
                 except GitHubAPIError:
-                    # Large or unsupported files may not be available through
-                    # the Contents API. Keep the patch so review can continue.
+                    # Continue review using the patch when content
+                    # is unavailable through the Contents API.
                     result["content"] = None
 
             files.append(result)
 
-        # Return the commit information in Checkmate's expected format.
+        # Preserve the commit author's name for database persistence.
         commit_author = (
             commit.get("commit", {})
             .get("author", {})

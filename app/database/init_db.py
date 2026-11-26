@@ -1,32 +1,28 @@
-
 """
-Database initialization utilities.
+Initializes the database schema asynchronously.
 
-Creates all registered SQLAlchemy tables in the configured database.
-
-ORM models must be imported before create_all() so their table
-definitions are registered with Base.metadata.
+All registered SQLAlchemy models are created during application startup.
 """
 
 import logging
 
 from app.database.base import Base
-from app.database.models import FileReview, ReviewRun  # noqa: F401
+from app.database.models import FileReview, ReviewRun
 from app.database.session import engine
+
 
 logger = logging.getLogger(__name__)
 
 
-def initialize_database() -> None:
+async def initialize_database() -> None:
     """
-    Create database tables that do not already exist.
+    Create registered database tables if they do not already exist.
 
-    Existing tables and their data are preserved. This is suitable
-    for initial schema creation, not for modifying existing schemas.
-    Use database migrations when the schema evolves.
+    run_sync bridges SQLAlchemy's synchronous metadata operation into
+    the asynchronous engine connection.
     """
-
-    Base.metadata.create_all(bind=engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
 
     logger.info(
         "Database initialized successfully. Registered tables: %s",

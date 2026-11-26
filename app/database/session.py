@@ -1,80 +1,81 @@
+
 """
-Manages the SQLite database engine and SQLAlchemy sessions.
+Manages the asynchronous SQLite database engine and SQLAlchemy sessions.
 
-The database file is stored in the project root by default.
-DATABASE_URL can override the default connection string.
-
-get_db() provides a request-scoped database session through FastAPI
-dependency injection. Each session is closed after the request ends.
+The database URL can be overridden through the DATABASE_URL environment
+variable. The default database remains checkmate.db in the project root.
 """
 
 import os
 from pathlib import Path
-from collections.abc import Generator
+from typing import AsyncGenerator
 
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-# Resolve the project root independently of the working directory.
+
+# Resolve the project root and preserve the existing database location.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-# Store the SQLite database in the project root.
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "checkmate.db"
 
-# Allow the database connection to be configured through the environment.
+# Preserve the existing environment-variable override.
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     f"sqlite:///{DEFAULT_DATABASE_PATH.as_posix()}",
 )
 
-# SQLite requires this option when connections may be used across threads,
-# as can happen in a FastAPI application.
-connect_args = (
-    {"check_same_thread": False}
-    if DATABASE_URL.startswith("sqlite")
-    else {}
-)
+# Convert the existing SQLite URL to its asynchronous driver equivalent.
+if DATABASE_URL.startswith("sqlite:///"):
+    ASYNC_DATABASE_URL = DATABASE_URL.replace(
+        "sqlite:///",
+        "sqlite+aiosqlite:///",
+        1,
+    )
+else:
+    # Non-SQLite URLs must already specify a compatible async driver.
+    ASYNC_DATABASE_URL = DATABASE_URL
 
-# Create the SQLAlchemy engine.
-engine = create_engine(
-    DATABASE_URL,
-    connect_args=connect_args,
+
+# Create one asynchronous engine for the application process.
+engine = create_async_engine(
+    ASYNC_DATABASE_URL,
     pool_pre_ping=True,
 )
 
-# Enable SQLite foreign-key enforcement for every connection.
-if DATABASE_URL.startswith("sqlite"):
 
-    @event.listens_for(engine, "connect")
+# Enable SQLite foreign-key enforcement on every connection.
+if ASYNC_DATABASE_URL.startswith("sqlite+aiosqlite://"):
+
+    @event.listens_for(engine.sync_engine, "connect")
     def enable_sqlite_foreign_keys(dbapi_connection, connection_record):
-        """Enable foreign-key constraints on each SQLite connection."""
-
+        """Enable SQLite foreign-key constraints for each connection."""
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
-# Create a reusable factory for database sessions.
-SessionLocal = sessionmaker(
+# Create one asynchronous session per request.
+AsyncSessionLocal = async_sessionmaker(
     bind=engine,
-    class_=Session,
+    class_=AsyncSession,
     autocommit=False,
     autoflush=False,
     expire_on_commit=False,
 )
 
 
-def get_db() -> Generator[Session, None, None]:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
-    Provide a database session through FastAPI dependency injection.
+    Provide a request-scoped asynchronous database session.
 
-    The session is always closed after the request finishes, including
-    when an exception occurs.
+    The session is automatically closed after the request completes,
+    including when an exception occurs.
     """
-
-    db = SessionLocal()
-
-    try:
+    async with AsyncSessionLocal() as db:
         yield db
-    finally:
-        db.close()

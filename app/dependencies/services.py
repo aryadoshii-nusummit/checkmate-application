@@ -1,36 +1,32 @@
 ﻿"""Dependencies for providing application services."""
 
-
 from fastapi import Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
 from app.repositories import ReviewRepository
 from app.services.github_service import GitHubClient
 from app.services.ollama_service import OllamaClient
 from app.services.review_service import ReviewService
-from app.services.webhook_service import (
-    GitHubClientFactory,
-    WebhookService,
-)
+from app.services.webhook_service import GitHubClientFactory, WebhookService
 
 
-def get_review_repository(
-    db: Session = Depends(get_db),
+async def get_review_repository(
+    db: AsyncSession = Depends(get_db),
 ) -> ReviewRepository:
-    """Provide a repository using the request-scoped database session."""
+    """Provide a repository using the request-scoped async session."""
 
     return ReviewRepository(db)
 
 
 def get_github_client_factory() -> GitHubClientFactory:
-    """Provide a factory for creating GitHub API clients."""
+    """Provide the GitHub client factory."""
 
     return GitHubClient
 
 
 def get_ollama_client() -> OllamaClient:
-    """Provide an Ollama client configured from application settings."""
+    """Provide the Ollama client."""
 
     return OllamaClient()
 
@@ -38,7 +34,7 @@ def get_ollama_client() -> OllamaClient:
 def get_review_service(
     ollama_client: OllamaClient = Depends(get_ollama_client),
 ) -> ReviewService:
-    """Provide a review service with its injected Ollama client."""
+    """Provide the code review service."""
 
     return ReviewService(ollama_client=ollama_client)
 
@@ -50,7 +46,7 @@ def get_webhook_service(
     ),
     review_service: ReviewService = Depends(get_review_service),
 ) -> WebhookService:
-    """Provide a webhook service with its required dependencies."""
+    """Provide the webhook service with its required dependencies."""
 
     return WebhookService(
         review_repository=review_repository,

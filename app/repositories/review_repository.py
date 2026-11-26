@@ -1,14 +1,15 @@
-
-"""Persistence operations for completed Checkmate code reviews."""
+"""Repository for asynchronously persisting and retrieving code reviews."""
 
 import logging
 
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import FileReview, ReviewRun
 from app.models.github import ReviewFileResult, ReviewRunStatus
+
 
 logger = logging.getLogger(__name__)
 
@@ -20,43 +21,39 @@ class DuplicateDeliveryError(Exception):
 class ReviewRepository:
     """Manage review-run persistence and retrieval."""
 
-    def __init__(self, db: Session) -> None:
-        """Initialize the repository with an injected database session."""
-
+    def __init__(self, db: AsyncSession) -> None:
+        """Initialize the repository with an injected async session."""
         self.db = db
 
-    def get_by_delivery_id(
+    async def get_by_delivery_id(
         self,
         delivery_id: str,
     ) -> ReviewRun | None:
         """Retrieve an existing review run using its GitHub delivery ID."""
 
-        statement = select(ReviewRun).where(
-            ReviewRun.delivery_id == delivery_id
+        statement = (
+            select(ReviewRun)
+            .options(selectinload(ReviewRun.file_reviews))
+            .where(ReviewRun.delivery_id == delivery_id)
         )
 
-        return self.db.scalar(statement)
+        return await self.db.scalar(statement)
 
-    def save_review_run(
+    async def save_review_run(
         self,
         *,
         delivery_id: str,
         repository: str,
         branch: str,
         commit_sha: str,
-        updated_by: str | None,
-        commit_author: str | None,
+        updated_by: str,
+        commit_author: str,
         status: ReviewRunStatus,
         reviews: list[ReviewFileResult],
     ) -> ReviewRun:
-        """
-        Persist a review run and all its file reviews atomically.
+        """Persist a review run and its file reviews in one transaction."""
 
-        The parent record and its file-review records are committed as one
-        transaction. If any operation fails, the transaction is rolled back.
-        """
-
-        existing = self.get_by_delivery_id(delivery_id)
+        existing = await self.get_by_delivery_id(delivery_id)
 
         if existing is not None:
             raise DuplicateDeliveryError(
@@ -91,7 +88,9 @@ class ReviewRepository:
 
         try:
             self.db.add(review_run)
-            self.db.flush()
+
+            # Flush to obtain the generated review_run.id.
+            await self.db.flush()
 
             file_reviews = [
                 FileReview(
@@ -107,14 +106,17 @@ class ReviewRepository:
                     overall_quality=review.get("quality"),
                     strengths=review.get("strengths", []),
                     areas_to_improve=review.get("areas_to_improve", []),
-                    additional_suggestions=review.get("additional_suggestions", []),
+                    additional_suggestions=review.get(
+                        "additional_suggestions", []
+                    ),
                 )
                 for review in reviews
             ]
 
             self.db.add_all(file_reviews)
-            self.db.commit()
-            self.db.refresh(review_run)
+
+            await self.db.commit()
+            await self.db.refresh(review_run)
 
             logger.info(
                 "Persisted review run: delivery=%s repository=%s "
@@ -128,11 +130,10 @@ class ReviewRepository:
             return review_run
 
         except IntegrityError as exc:
-            self.db.rollback()
+            await self.db.rollback()
 
-            # A concurrent webhook may have inserted this delivery after
-            # the initial existence check.
-            existing = self.get_by_delivery_id(delivery_id)
+            # Another concurrent webhook may have inserted this delivery.
+            existing = await self.get_by_delivery_id(delivery_id)
 
             if existing is not None:
                 raise DuplicateDeliveryError(
@@ -146,7 +147,8 @@ class ReviewRepository:
             raise
 
         except Exception:
-            self.db.rollback()
+            await self.db.rollback()
+
             logger.exception(
                 "Failed to persist review run for delivery %s",
                 delivery_id,

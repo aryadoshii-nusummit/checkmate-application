@@ -1,16 +1,12 @@
-
 """Application service for processing verified GitHub webhooks."""
 
 import logging
-from typing import Callable
+from collections.abc import Callable
 
-
-from app.database.models import ReviewRun
 from app.models.github import (
     ChangedFileSummary,
     FileReview,
     GitHubWebhookResponse,
-    ReviewRunStatus,
     SkippedFile,
     WebhookVerification,
 )
@@ -18,8 +14,11 @@ from app.repositories import DuplicateDeliveryError, ReviewRepository
 from app.services.github_service import GitHubAPIError, GitHubClient
 from app.services.review_service import ReviewService
 
+
 logger = logging.getLogger(__name__)
 
+
+# Factory type for creating GitHub API clients.
 GitHubClientFactory = Callable[[], GitHubClient]
 
 
@@ -27,6 +26,8 @@ class WebhookProcessingError(Exception):
     """Error raised when the webhook review workflow cannot be completed."""
 
     def __init__(self, status_code: int, detail: str) -> None:
+        """Initialize the error with an HTTP status code and detail."""
+
         self.status_code = status_code
         self.detail = detail
         super().__init__(detail)
@@ -41,7 +42,7 @@ class WebhookService:
         github_client_factory: GitHubClientFactory,
         review_service: ReviewService,
     ) -> None:
-        """Initialize the service with its injected dependencies."""
+        """Initialize the service with its required dependencies."""
 
         self.review_repository = review_repository
         self.github_client_factory = github_client_factory
@@ -49,7 +50,7 @@ class WebhookService:
 
     @staticmethod
     def _build_duplicate_response(
-        review_run: ReviewRun,
+        review_run,
     ) -> GitHubWebhookResponse:
         """Build an acknowledgement for an already persisted delivery."""
 
@@ -94,6 +95,7 @@ class WebhookService:
                 verification.delivery_id,
                 verification.ignored_reason,
             )
+
             return GitHubWebhookResponse(
                 status="ignored",
                 reason=verification.ignored_reason,
@@ -121,7 +123,7 @@ class WebhookService:
 
         # Check idempotency before making external API or AI calls.
         try:
-            existing_run = self.review_repository.get_by_delivery_id(
+            existing_run = await self.review_repository.get_by_delivery_id(
                 verification.delivery_id
             )
         except Exception as exc:
@@ -149,18 +151,21 @@ class WebhookService:
             commit_sha,
         )
 
+        # Create the GitHub client through the injected factory.
         try:
             async with self.github_client_factory() as github:
                 commit_data = await github.fetch_commit(
                     repository,
                     commit_sha,
                 )
+
         except ValueError as exc:
             logger.warning("Invalid GitHub retrieval input: %s", exc)
             raise WebhookProcessingError(
                 400,
                 "Invalid repository or commit information.",
             ) from exc
+
         except GitHubAPIError as exc:
             logger.exception(
                 "GitHub retrieval failed for %s at %s",
@@ -196,10 +201,12 @@ class WebhookService:
             len(file_summaries),
         )
 
+        # Delegate AI review to the injected review service.
         try:
             review_result = await self.review_service.review_commit_files(
                 commit_data["files"]
             )
+
         except Exception as exc:
             logger.exception(
                 "AI review failed for %s at %s",
@@ -215,14 +222,15 @@ class WebhookService:
                 ),
             ) from exc
 
-        status: ReviewRunStatus = (
+        status = (
             "completed_with_skips"
             if review_result["skipped_file_count"] > 0
             else "completed"
         )
 
+        # Persist the completed review.
         try:
-            self.review_repository.save_review_run(
+            await self.review_repository.save_review_run(
                 delivery_id=verification.delivery_id,
                 repository=commit_data["repository"],
                 branch=branch,
@@ -232,18 +240,22 @@ class WebhookService:
                 status=status,
                 reviews=review_result["reviews"],
             )
+
         except DuplicateDeliveryError:
             # Another request may have completed the same delivery
             # between the initial lookup and the database insert.
-            existing_run = self.review_repository.get_by_delivery_id(
+            existing_run = await self.review_repository.get_by_delivery_id(
                 verification.delivery_id
             )
+
             if existing_run is not None:
                 return self._build_duplicate_response(existing_run)
+
             raise WebhookProcessingError(
                 500,
                 "The review delivery conflicted with another database operation.",
             )
+
         except Exception as exc:
             logger.exception(
                 "Could not persist review results for delivery %s",
@@ -274,7 +286,10 @@ class WebhookService:
             files=file_summaries,
             reviewed_file_count=review_result["reviewed_file_count"],
             skipped_file_count=review_result["skipped_file_count"],
-            reviews=[FileReview(**item) for item in review_result["reviews"]],
+            reviews=[
+                FileReview(**item)
+                for item in review_result["reviews"]
+            ],
             skipped_files=[
                 SkippedFile(**item)
                 for item in review_result["skipped_files"]

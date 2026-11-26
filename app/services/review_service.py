@@ -14,6 +14,7 @@ from app.models.github import (
 from app.models.review import ReviewResult
 from app.services.ollama_service import OllamaClient
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,10 +38,14 @@ def _format_review_report(result: ReviewResult) -> str:
     sections.append("\n## Findings")
 
     if not result.findings:
-        sections.append("No significant issues identified in the supplied code.")
+        sections.append(
+            "No significant issues identified in the supplied code."
+        )
     else:
         for finding in result.findings:
-            lines = ", ".join(str(number) for number in finding.line_numbers)
+            lines = ", ".join(
+                str(number) for number in finding.line_numbers
+            )
 
             sections.extend([
                 f"\n### {finding.title}",
@@ -73,12 +78,17 @@ def _count_findings(result: ReviewResult) -> dict[str, int]:
         finding.severity in {"CRITICAL", "HIGH", "MEDIUM"}
         for finding in result.findings
     )
+
     warnings = sum(
         finding.severity == "LOW"
         for finding in result.findings
     )
+
     suggestions = (
-        sum(finding.severity == "INFO" for finding in result.findings)
+        sum(
+            finding.severity == "INFO"
+            for finding in result.findings
+        )
         + len(result.additional_suggestions)
     )
 
@@ -101,19 +111,18 @@ class ReviewService:
         files: list[GitHubChangedFile],
     ) -> ReviewServiceResult:
         """
-        Review eligible files from a GitHub commit using Ollama.
+        Review eligible files from a GitHub commit.
 
-        Each eligible file receives a validated structured review. Files that
-        cannot be reviewed are reported explicitly rather than silently ignored.
+        Files that cannot be reviewed are reported explicitly rather
+        than silently ignored.
         """
 
-        client = self.ollama_client
         reviews: list[ReviewFileResult] = []
         skipped_files: list[SkippedFileResult] = []
 
         for file in files:
-            path = file.get("path", "")
-            content = file.get("content")
+            path = file["path"]
+            content = file["content"]
             extension = os.path.splitext(path)[1].lower()
 
             if extension not in REVIEWABLE_EXTENSIONS:
@@ -149,19 +158,22 @@ class ReviewService:
                 continue
 
             try:
-                result = await client.review_code(
+                result = await self.ollama_client.review_code(
                     file_path=path,
                     code=content,
                 )
             except Exception:
-                logger.exception("AI review failed for file %s", path)
+                logger.exception(
+                    "AI review failed for file %s",
+                    path,
+                )
                 raise
 
             counts = _count_findings(result)
 
             reviews.append({
                 "path": path,
-                "status": file.get("status", "modified"),
+                "status": file["status"],
                 "review": _format_review_report(result),
                 "quality": result.overall_quality,
                 "summary": result.summary,

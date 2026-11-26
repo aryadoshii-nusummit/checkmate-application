@@ -5,10 +5,16 @@ These tests verify webhook processing without making external GitHub
 or Ollama requests. External dependencies are mocked at the service boundary.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy.ext.asyncio import (
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import StaticPool
+
+from app.database.base import Base
 
 from app.models.github import WebhookVerification
 from app.repositories import ReviewRepository
@@ -21,9 +27,6 @@ from app.services.webhook_service import (
 )
 
 
-def run_async(coroutine):
-    """Run an asynchronous service operation in a synchronous pytest test."""
-    return asyncio.run(coroutine)
 
 
 def make_verification(**overrides):
@@ -84,35 +87,34 @@ def make_webhook_service(db_session):
     )
 
 
-def test_ignored_webhook_returns_ignored_response(db_session):
+@pytest.mark.anyio
+async def test_ignored_webhook_returns_ignored_response(db_session):
     """Ignored webhook events should return without external processing."""
     verification = make_verification(
         ignored_reason="branch_not_configured"
     )
 
-    response = run_async(
-        make_webhook_service(db_session).process_webhook(verification)
-    )
+    response = await make_webhook_service(db_session).process_webhook(verification)
 
     assert response.status == "ignored"
     assert response.reason == "branch_not_configured"
     assert response.delivery_id == "test-delivery-001"
 
 
-def test_missing_verified_commit_information_returns_server_error(db_session):
+@pytest.mark.anyio
+async def test_missing_verified_commit_information_returns_server_error(db_session):
     """Missing repository, branch, or commit information should be rejected."""
     verification = make_verification(branch=None)
 
     with pytest.raises(WebhookProcessingError) as exc_info:
-        run_async(
-            make_webhook_service(db_session).process_webhook(verification)
-        )
+        await make_webhook_service(db_session).process_webhook(verification)
 
     assert exc_info.value.status_code == 500
     assert "missing required commit information" in exc_info.value.detail
 
 
-def test_successful_webhook_processing(db_session):
+@pytest.mark.anyio
+async def test_successful_webhook_processing(db_session):
     """A valid push should fetch the commit and invoke the review service."""
     verification = make_verification()
     commit_response = make_commit_response()
@@ -139,9 +141,7 @@ def test_successful_webhook_processing(db_session):
             return_value=review_result,
         ) as review_mock,
     ):
-        response = run_async(
-            make_webhook_service(db_session).process_webhook(verification)
-        )
+        response = await make_webhook_service(db_session).process_webhook(verification)
 
     github_client.fetch_commit.assert_awaited_once_with(
         "owner/test-repo",
@@ -161,7 +161,8 @@ def test_successful_webhook_processing(db_session):
     assert response.skipped_file_count == 0
 
 
-def test_review_failure_returns_bad_gateway(db_session):
+@pytest.mark.anyio
+async def test_review_failure_returns_bad_gateway(db_session):
     """Review failures should be translated into a service-level error."""
     verification = make_verification()
     github_context, _ = make_github_context(
@@ -180,48 +181,47 @@ def test_review_failure_returns_bad_gateway(db_session):
         ),
     ):
         with pytest.raises(WebhookProcessingError) as exc_info:
-            run_async(
-                make_webhook_service(db_session).process_webhook(verification)
-            )
+            await make_webhook_service(db_session).process_webhook(verification)
 
     assert exc_info.value.status_code == 502
     assert "AI code review failed" in exc_info.value.detail
 
 
 @pytest.fixture
-def db_session():
-    """Provide an isolated in-memory database for webhook service tests."""
+def anyio_backend():
+    """Use asyncio as the backend for AnyIO tests."""
+    return "asyncio"
 
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    from sqlalchemy.pool import StaticPool
 
-    from app.database.base import Base
-    from app.database.models import FileReview, ReviewRun
+@pytest.fixture
+async def db_session(anyio_backend):
+    """Provide an isolated asynchronous in-memory database."""
 
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
     )
 
-    Base.metadata.create_all(bind=engine)
-
-    testing_session = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-
-    session = testing_session()
-
     try:
-        yield session
-    finally:
-        session.close()
-        engine.dispose()
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
 
-def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session):
+        testing_session = async_sessionmaker(
+            bind=engine,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+
+        async with testing_session() as session:
+            yield session
+
+    finally:
+        await engine.dispose()
+
+
+
+@pytest.mark.anyio
+async def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session):
     """Repeated deliveries should return stored results without external calls."""
     verification = make_verification()
     commit_response = make_commit_response()
@@ -268,9 +268,7 @@ def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session
             return_value=review_result,
         ) as first_review_mock,
     ):
-        first_response = run_async(
-            make_webhook_service(db_session).process_webhook(verification)
-        )
+        first_response = await make_webhook_service(db_session).process_webhook(verification)
 
     assert first_response.status == "accepted"
     github_client.fetch_commit.assert_awaited_once_with(
@@ -289,9 +287,7 @@ def test_duplicate_delivery_returns_saved_review_without_reprocessing(db_session
             new_callable=AsyncMock,
         ) as review_mock,
     ):
-        duplicate_response = run_async(
-            make_webhook_service(db_session).process_webhook(verification)
-        )
+        duplicate_response = await make_webhook_service(db_session).process_webhook(verification)
 
     assert duplicate_response.status == "duplicate"
     assert duplicate_response.delivery_id == verification.delivery_id
